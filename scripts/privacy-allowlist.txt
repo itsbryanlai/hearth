@@ -1,0 +1,10 @@
+# One extended regex per line, matched against each hard-coded URL found in
+# apps/ crates/ sidecars/ packages/. Lines starting with # are comments.
+# Add an entry only for docs links or local-only addresses, never for a remote service.
+
+# Tauri IPC origin on non-macOS webviews; local only, named in the CSP.
+^http://ipc\.localhost($|[/:])
+# Tauri IPC scheme token used in the CSP connect-src (not an http URL; kept so the CSP line stays reviewable).
+^ipc:
+# Tauri dev server on this machine.
+^http://localhost:1420($|/)

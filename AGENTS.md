@@ -13,7 +13,7 @@ Rules for anyone (human or agent) changing Hearth. The design is in [docs/spec.m
 5. **All data is local** in the Hearth data dir and deletable from Settings. Diagnostics are exported only by the user, to a local file they see first.
 6. **Nothing is pushed, committed or opened** on a remote without an explicit user action.
 
-Banned dependencies (direct or transitive; CI fails on a match): `posthog*`, `@sentry/*`, `sentry`, `segment`, `@segment/*`, `mixpanel*`, `amplitude*`, `@amplitude/*`, `@axiomhq/*`, `@datadog/*`, `dd-trace`, `@opentelemetry/exporter-*`, `logrocket`, `fullstory`, `bugsnag`, `rollbar`, `@vercel/analytics`; in Rust core crates also `reqwest`, `hyper` (client), `ureq`, `surf`, `isahc`, `sentry`.
+Banned dependencies (direct or transitive; CI fails on a match; the authoritative list is in `scripts/privacy-gates.sh`, keep this copy in sync): `posthog*`, `@sentry/*`, `sentry`, `segment`, `@segment/*`, `mixpanel*`, `amplitude*`, `@amplitude/*`, `@axiomhq/*`, `@datadog/*`, `dd-trace`, `@opentelemetry/exporter-*`, `logrocket`, `fullstory`, `bugsnag`, `rollbar`, `@vercel/analytics`; in Rust core crates also `reqwest`, `hyper` (client), `ureq`, `surf`, `isahc`, `sentry`.
 
 ### Agents (spec §4.3)
 
