@@ -185,7 +185,7 @@ crates/adapter-codex/  app-server JSON-RPC client
 crates/mcp-local/      thread-scoped stdio MCP server
 packages/protocol/     shared AgentEvent / IPC types (TS + generated Rust)
 fixtures/              recorded agent sessions for replay tests
-docs/                  PRIVACY.md, ADRs, CONTEXT.md
+docs/                  ADRs, CONTEXT.md (PRIVACY.md lives at the repo root)
 ```
 
 ---
