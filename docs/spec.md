@@ -117,7 +117,7 @@ interface Session {
 `AgentEvent` is Hearth's own normalized union: `text.delta`, `reasoning.delta`, `tool.start`, `tool.output`, `tool.end`, `file.edit`, `command.run`, `approval.request`, `usage`, `turn.end`, `error`. The raw agent event is kept alongside for debugging (stored locally only).
 
 - **Codex adapter**: spawns `codex app-server`, speaks JSON-RPC over stdio, and maps thread, turn, and item notifications to `AgentEvent`.
-- **Claude Code adapter**: uses the Claude Agent SDK `query()` with `canUseTool` for approvals and `resume` for continuity, running the user's installed `claude` executable. It lives in a small bundled Node sidecar (see §5). Fallback if the SDK route is blocked: `claude -p --input-format stream-json --output-format stream-json` directly from Rust.
+- **Claude Code adapter**: spawns the user's installed `claude` directly from the Rust core as `claude -p --input-format stream-json --output-format stream-json --verbose --include-partial-messages --permission-prompt-tool stdio` and speaks its stdio control protocol: `can_use_tool` control requests for approvals, `interrupt` and `set_model` control requests, and `--resume <session id>` for continuity. There is no Node sidecar. The decision and its evidence are in `docs/decisions/0001-claude-integration.md`.
 
 ### 4.4 Model switching and hand-off
 
@@ -153,13 +153,10 @@ interface Session {
 │                   ▼                                                  │
 │  Core (Rust)                                                         │
 │    • thread/turn store (SQLite, WAL)    • git & worktree service     │
-│    • process supervisor (agents, sidecar, gh)                        │
-│    • adapter host: Codex (JSON-RPC stdio, in Rust)                   │
+│    • process supervisor (agents, gh)                                 │
+│    • adapter host: Codex (JSON-RPC stdio), Claude (stream-json stdio)│
 │    • local MCP server (stdio, per session)                           │
 │    • file-access guard, egress policy                                │
-│                   ▲ stdio (newline-delimited JSON)                   │
-│                   ▼                                                  │
-│  Claude sidecar (Node, bundled): Claude Agent SDK → user's `claude`  │
 └──────────────────────────────────────────────────────────────────────┘
           spawns ▼                 spawns ▼              spawns ▼
         `codex app-server`         `claude`             `git`, `gh`
@@ -176,7 +173,7 @@ interface Session {
 | UI | React 19 + TypeScript, Vite, TanStack Virtual, Zustand, CodeMirror 6 for diffs | Mature tools; virtualization is mandatory for long threads. |
 | Core | Rust (tokio, rusqlite, serde) | Predictable latency, no GC pauses, and easy process supervision. |
 | Storage | SQLite at `~/Library/Application Support/Hearth/hearth.db` | Local, inspectable, exportable. |
-| Claude integration | Agent SDK in a Node sidecar (spike in M0 against the direct CLI `stream-json` route; pick one) | The SDK is the supported route for approvals and resume. The sidecar only talks stdio to the core and has no network access of its own beyond what the `claude` child process does. |
+| Claude integration | Direct `claude` CLI over stream-json on stdio, driven from the Rust core (ADR 0001; the Agent SDK sidecar was rejected) | The CLI's control protocol covers approvals, interrupt, model switch and resume, which is all the SDK wraps. Dropping the sidecar removes a Node runtime, a ~65 MB dependency tree and a ~50 MB process, and leaves no third-party package between the core and the child. |
 | Packages | pnpm workspace + Cargo workspace | — |
 
 **Repo layout (proposed)**
@@ -186,7 +183,6 @@ apps/desktop/          Tauri app (src-tauri/ Rust core, src/ React UI)
 crates/core/           store, git, supervisor, egress & fs guards
 crates/adapter-codex/  app-server JSON-RPC client
 crates/mcp-local/      thread-scoped stdio MCP server
-sidecars/claude/       Node Agent SDK bridge
 packages/protocol/     shared AgentEvent / IPC types (TS + generated Rust)
 fixtures/              recorded agent sessions for replay tests
 docs/                  PRIVACY.md, ADRs, CONTEXT.md
@@ -211,8 +207,7 @@ docs/                  PRIVACY.md, ADRs, CONTEXT.md
 - **CSP**: `default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' data:` with no remote origins.
 - **Rust core has no HTTP client crate.** `cargo-deny` bans `reqwest`, `hyper` client, `ureq`, `surf`, `isahc`, and similar in core crates.
 - **File-access guard**: all core file reads go through one module with an allowlist (added project dirs, their worktrees, and the Hearth data dir). A denylist (`~/.claude*`, `~/.codex`, `~/.config/gh`, `~/.ssh`, `~/Library/Keychains`) panics in debug builds and is covered by tests.
-- **Sidecar**: launched with a minimal env and `NODE_OPTIONS` cleared. Its dependency tree is locked and audited.
-- **Agent processes** inherit the user's env (they need it to authenticate). Hearth never logs env values.
+- **Agent processes** get an explicit environment: which variables pass through (credentials and provider variables in particular) is decided in M2 (proposal in ADR 0001). Hearth never logs env values.
 
 ### 6.3 Enforcement in CI
 
@@ -281,7 +276,7 @@ Ordered by dependency, not dated: each one starts when the one before it is merg
 
 | # | Outcome |
 |---|---|
-| M0 | Repo scaffolding, CI (lint, test, privacy gates, egress test skeleton), Tauri shell, `PRIVACY.md`. **Spikes:** Claude Agent SDK sidecar vs direct CLI `stream-json`; Codex app-server handshake. An ADR for each. |
+| M0 | Repo scaffolding, CI (lint, test, privacy gates, egress test skeleton), Tauri shell, `PRIVACY.md`. **Spikes:** Claude integration (decided: direct CLI `stream-json`, ADR 0001); Codex app-server handshake. An ADR for each. |
 | M1 | One agent end to end: Codex thread with streaming, approvals, interrupt, persistence, transcript virtualization. Replay fixtures. |
 | M2 | Claude Code adapter at parity. Model picker; same-agent model switch. |
 | M3 | Worktrees per thread, diff panel (thread and per-turn), commit, push, PR via `gh`. |
