@@ -1,0 +1,13 @@
+[package]
+name = "hearth-protocol"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+ts-rs = "12"
+uuid = { version = "1", features = ["v7"] }
+
+[dev-dependencies]
+serde_json = "1"
