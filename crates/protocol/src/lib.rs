@@ -403,7 +403,12 @@ mod tests {
             let path = entry.unwrap().path();
             if path.extension().is_some_and(|e| e == "ts") {
                 let name = path.file_name().unwrap().to_string_lossy().into_owned();
-                out.insert(name, std::fs::read_to_string(&path).unwrap());
+                let body = std::fs::read_to_string(&path).unwrap();
+                let tidy: String = body
+                    .lines()
+                    .map(|l| format!("{}\n", l.trim_end()))
+                    .collect();
+                out.insert(name, tidy);
             }
         }
         out

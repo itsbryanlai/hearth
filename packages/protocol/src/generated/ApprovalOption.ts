@@ -4,7 +4,7 @@ import type { ApprovalOptionKind } from "./ApprovalOptionKind";
 /**
  * One choice the agent offered for an approval.
  */
-export type ApprovalOption = { 
+export type ApprovalOption = {
 /**
  * The agent's id for this option, echoed back when answering.
  */

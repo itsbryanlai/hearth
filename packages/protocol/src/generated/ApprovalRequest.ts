@@ -5,7 +5,7 @@ import type { ApprovalOption } from "./ApprovalOption";
 /**
  * An agent asking permission to use a tool.
  */
-export type ApprovalRequest = { id: ApprovalId, tool: string, title: string, 
+export type ApprovalRequest = { id: ApprovalId, tool: string, title: string,
 /**
  * What exactly would run or change (a command line, a path).
  */
