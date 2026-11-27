@@ -9,7 +9,7 @@ Status: Draft v0.2 · 2026-11-27
 
 ## 1. Why this exists
 
-A desktop app that drives the coding agents you already pay for (Claude Code, Codex) from one window, with git worktrees and pull requests built in, is a strong idea. But such a tool sits on top of your code, your prompts, your agent sessions and your agent logins. Tools in this category have been found sending usage analytics by default, keeping copies of raw events on their own servers, and reading agent login files to link a user's accounts and machines.
+A desktop app that drives the coding agents you already use (Claude Code, Qwen Code) from one window, with git worktrees and pull requests built in, is a strong idea. But such a tool sits on top of your code, your prompts, your agent sessions and your agent logins. Tools in this category have been found sending usage analytics by default, keeping copies of raw events on their own servers, and reading agent login files to link a user's accounts and machines.
 
 Hearth is built so that none of that is possible:
 
@@ -32,13 +32,13 @@ Hearth is built so that none of that is possible:
 
 **Yes.** All of the hard parts have official, documented integration points:
 
-- **Codex**: `codex app-server`, a JSON-RPC protocol over stdio. It's what OpenAI's own IDE extension uses. It covers threads, turns, streaming items, approvals, and model selection.
+- **Qwen Code**: `qwen --acp`, the Agent Client Protocol (v1, JSON-RPC over stdio). It covers sessions, streaming updates, permission requests, cancel, resume and model selection (ADR 0002).
 - **Claude Code**: the **Claude Agent SDK** (TypeScript) or the `claude` CLI in headless `stream-json` mode. Both run the user's own `claude` install with its own login, and both handle tool-permission callbacks.
 - **Git**: the `git` CLI (worktrees, diff, commit, push). **PRs**: the `gh` CLI with the user's own `gh auth`.
 
 ### Risks to resolve early
 
-1. **Protocol churn.** Codex app-server and Claude's stream protocol change often. Mitigation: a thin adapter per agent, recorded replay fixtures, and pinned "known-good CLI version" ranges with a clear warning outside the range.
+1. **Protocol churn.** Qwen Code's ACP support and Claude's stream protocol change often. Mitigation: a thin adapter per agent, recorded replay fixtures, and pinned "known-good CLI version" ranges with a clear warning outside the range.
 2. **Performance claims are easy to make and hard to keep.** Mitigation: budgets in CI from M0 (§7).
 
 ---
@@ -46,8 +46,8 @@ Hearth is built so that none of that is possible:
 ## 3. v1 scope
 
 ### In scope
-1. **Your subscriptions.** Drive locally installed, already signed-in agents. Hearth never sells, proxies, or sees tokens.
-2. **Every agent in one place.** Claude Code and Codex in v1. Change model mid-thread. Hand a task from one agent to another.
+1. **Your subscriptions and keys.** Drive locally installed agents, already signed in or set up with your own provider key. Hearth never sells, proxies, or sees tokens.
+2. **Every agent in one place.** Claude Code and Qwen Code in v1. Change model mid-thread. Hand a task from one agent to another.
 3. **macOS desktop app** (Apple Silicon first, Intel best-effort).
 4. **Git built in.** Optional worktree per thread, diff review, then commit, push, and open a PR in one action.
 5. **Fast.** Measured budgets, enforced in CI.
@@ -56,7 +56,7 @@ Hearth is built so that none of that is possible:
 - Remote access, relays, mobile and web clients, accounts, cloud sync (each one is a surface where data can leave the machine).
 - Distribution to anyone but the author (§1, private use only).
 - Windows and Linux.
-- Agents other than Claude Code and Codex (the adapter interface is designed for more: ACP agents, OpenCode, Cursor CLI, Gemini CLI).
+- Agents other than Claude Code and Qwen Code (the adapter interface is designed for more; the ACP adapter is a route to other ACP agents such as OpenCode or Gemini CLI).
 - Forges other than GitHub.
 - Any updater or update check (update by pulling and rebuilding; see §6.4).
 
@@ -93,13 +93,13 @@ Hearth is built so that none of that is possible:
 
 ### 4.3 Agents
 
-**Detection (no credential reads).** On launch, Hearth looks for `claude` and `codex` on `PATH` and in common install locations, then runs `--version`. Auth state is learned only from the agent's own response: if the first turn fails with an auth error, Hearth shows "Run `claude` / `codex login` in your terminal" with a button that opens Terminal. Hearth **never opens** `~/.claude*`, `~/.codex/*`, keychains, or any token store.
+**Detection (no credential reads).** On launch, Hearth looks for `claude` and `qwen` on `PATH` and in common install locations, then runs `--version`. Auth state is learned only from the agent's own response: if the first turn fails with an auth error, Hearth shows "Run `claude` / `qwen` in your terminal to sign in or set up your provider key" with a button that opens Terminal. Hearth **never opens** `~/.claude*`, `~/.qwen/*`, keychains, or any token store.
 
 **Adapter interface** (one per agent, same shape for future agents):
 
 ```ts
 interface AgentAdapter {
-  id: "claude-code" | "codex" | string;
+  id: "claude-code" | "qwen-code" | string;
   detect(): Promise<{ installed: boolean; version?: string; supported: boolean }>;
   listModels(): Promise<Model[]>;          // from the agent itself, not a remote manifest
   startSession(opts: { cwd: string; model: string; permissionMode: PermissionMode;
@@ -116,18 +116,18 @@ interface Session {
 
 `AgentEvent` is Hearth's own normalized union: `text.delta`, `reasoning.delta`, `tool.start`, `tool.output`, `tool.end`, `file.edit`, `command.run`, `approval.request`, `usage`, `turn.end`, `error`. The raw agent event is kept alongside for debugging (stored locally only).
 
-- **Codex adapter**: spawns `codex app-server`, speaks JSON-RPC over stdio, and maps thread, turn, and item notifications to `AgentEvent`.
+- **Qwen Code adapter**: spawns `qwen --acp` from the Rust core, speaks ACP (JSON-RPC over stdio), and maps `session/update` notifications and `session/request_permission` requests to `AgentEvent` (ADR 0002). Client rules: never call `authenticate`; send the no-persist flag on `session/set_model`; answer permissions one-shot (any "always allow" lives in Hearth's own store); set `QWEN_USAGE_STATISTICS_ENABLED=false`, `QWEN_TELEMETRY_ENABLED=false`, `QWEN_CODE_MODELS_DEV_REFRESH=off` and `QWEN_CODE_SKIP_UPDATE_CHECK_ONCE=true` on every spawn.
 - **Claude Code adapter**: spawns the user's installed `claude` directly from the Rust core as `claude -p --input-format stream-json --output-format stream-json --verbose --include-partial-messages --permission-prompt-tool stdio` and speaks its stdio control protocol: `can_use_tool` control requests for approvals, `interrupt` and `set_model` control requests, and `--resume <session id>` for continuity. There is no Node sidecar. The decision and its evidence are in `docs/decisions/0001-claude-integration.md`.
 
 ### 4.4 Model switching and hand-off
 
 - **Same agent, different model**: call `setModel` if supported. Otherwise resume the same agent session with the new model. Context is preserved natively.
-- **Different agent** (e.g. Claude to Codex): Hearth opens a new session for the target agent in the **same working directory/worktree**, so files carry over. It seeds the session with a **hand-off preamble** built locally from the Hearth transcript:
+- **Different agent** (e.g. Claude to Qwen Code): Hearth opens a new session for the target agent in the **same working directory/worktree**, so files carry over. It seeds the session with a **hand-off preamble** built locally from the Hearth transcript:
   - the original goal, and the user's latest instruction
   - a condensed transcript (user messages in full, agent messages summarized to key decisions, file paths touched, and commands run with exit codes)
   - the current `git status` and `git diff --stat`
   - The preamble is shown to the user and editable before it's sent.
-- **Agent-initiated hand-off** ("let Claude hand a task to Codex"): Hearth starts a **local, thread-scoped MCP server** (stdio, no network listener) and gives it to each agent session. It exposes:
+- **Agent-initiated hand-off** ("let Claude hand a task to Qwen Code"): Hearth starts a **local, thread-scoped MCP server** (stdio, no network listener) and gives it to each agent session. It exposes:
   - `hearth.handoff(target_agent, task, context_notes)`: asks the user to confirm, then runs the task as a **sub-thread** with the target agent in the same worktree and returns its final message to the caller.
   - `hearth.thread_info()`: returns the current branch, worktree path, and changed files.
   - No other tools in v1. Every call is logged in the transcript.
@@ -154,15 +154,15 @@ interface Session {
 │  Core (Rust)                                                         │
 │    • thread/turn store (SQLite, WAL)    • git & worktree service     │
 │    • process supervisor (agents, gh)                                 │
-│    • adapter host: Codex (JSON-RPC stdio), Claude (stream-json stdio)│
+│    • adapter host: Qwen Code (ACP stdio), Claude (stream-json stdio) │
 │    • local MCP server (stdio, per session)                           │
 │    • file-access guard, egress policy                                │
 └──────────────────────────────────────────────────────────────────────┘
           spawns ▼                 spawns ▼              spawns ▼
-        `codex app-server`         `claude`             `git`, `gh`
-   (talks to OpenAI with        (talks to Anthropic    (talks to your
-    the user's own login)        with the user's own    git remote / GitHub)
-                                 login)
+        `qwen --acp`               `claude`             `git`, `gh`
+   (talks to the user's         (talks to Anthropic    (talks to your
+    model provider with          with the user's own    git remote / GitHub)
+    the user's own key)          login)
 ```
 
 **Key decisions**
@@ -181,7 +181,7 @@ interface Session {
 ```
 apps/desktop/          Tauri app (src-tauri/ Rust core, src/ React UI)
 crates/core/           store, git, supervisor, egress & fs guards
-crates/adapter-codex/  app-server JSON-RPC client
+crates/adapter-qwen/   ACP (JSON-RPC stdio) client
 crates/mcp-local/      thread-scoped stdio MCP server
 packages/protocol/     shared AgentEvent / IPC types (TS + generated Rust)
 fixtures/              recorded agent sessions for replay tests
@@ -195,9 +195,9 @@ docs/                  ADRs, CONTEXT.md (PRIVACY.md lives at the repo root)
 ### 6.1 Guarantees (published in `PRIVACY.md`, each one tested)
 
 1. **No telemetry, analytics, crash reporting, or "usage pings"**: no code for them exists in the codebase.
-2. **Hearth itself makes no network requests** in v1. Network traffic comes only from the tools you already trust and run: `claude`, `codex`, `git`, `gh`, and links you click open in your browser.
+2. **Hearth itself makes no network requests** in v1. Network traffic comes only from the tools you already trust and run: `claude`, `qwen`, `git`, `gh`, and links you click open in your browser.
 3. **No accounts, no identifiers.** No install ID, device ID, or fingerprint is generated.
-4. **Never reads agent credentials or config** (`~/.claude*`, `~/.codex/*`, keychain items, `gh` tokens).
+4. **Never reads agent credentials or config** (`~/.claude*`, `~/.qwen/*`, `~/.codex/*`, keychain items, `gh` tokens).
 5. **All data is local** and deletable: one folder, plus "Delete all Hearth data" in Settings.
 6. **Diagnostics are manual.** "Export diagnostics" writes a local, redacted file and shows its contents before you save it. Hearth never uploads it.
 
@@ -206,7 +206,7 @@ docs/                  ADRs, CONTEXT.md (PRIVACY.md lives at the repo root)
 - **Tauri capabilities**: the webview gets only Hearth's own IPC commands. No `http`, `shell`, or `fs` plugins are exposed to JS.
 - **CSP**: `default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' data:` with no remote origins.
 - **Rust core has no HTTP client crate.** `cargo-deny` bans `reqwest`, `hyper` client, `ureq`, `surf`, `isahc`, and similar in core crates.
-- **File-access guard**: all core file reads go through one module with an allowlist (added project dirs, their worktrees, and the Hearth data dir). A denylist (`~/.claude*`, `~/.codex`, `~/.config/gh`, `~/.ssh`, `~/Library/Keychains`) panics in debug builds and is covered by tests.
+- **File-access guard**: all core file reads go through one module with an allowlist (added project dirs, their worktrees, and the Hearth data dir). A denylist (`~/.claude*`, `~/.qwen`, `~/.codex`, `~/.config/gh`, `~/.ssh`, `~/Library/Keychains`) panics in debug builds and is covered by tests.
 - **Agent processes** get an explicit environment: which variables pass through (credentials and provider variables in particular) is decided in M2 (proposal in ADR 0001). Hearth never logs env values.
 
 ### 6.3 Enforcement in CI
@@ -276,14 +276,14 @@ Ordered by dependency, not dated: each one starts when the one before it is merg
 
 | # | Outcome |
 |---|---|
-| M0 | Repo scaffolding, CI (lint, test, privacy gates, egress test skeleton), Tauri shell, `PRIVACY.md`. **Spikes:** Claude integration (decided: direct CLI `stream-json`, ADR 0001); Codex app-server handshake. An ADR for each. |
-| M1 | One agent end to end: Codex thread with streaming, approvals, interrupt, persistence, transcript virtualization. Replay fixtures. |
+| M0 | Repo scaffolding, CI (lint, test, privacy gates, egress test skeleton), Tauri shell, `PRIVACY.md`. **Spikes:** Claude integration (decided: direct CLI `stream-json`, ADR 0001); Qwen Code integration (decided: ACP, ADR 0002). An ADR for each. |
+| M1 | One agent end to end: Qwen Code thread with streaming, approvals, interrupt, persistence, transcript virtualization. Replay fixtures. |
 | M2 | Claude Code adapter at parity. Model picker; same-agent model switch. |
 | M3 | Worktrees per thread, diff panel (thread and per-turn), commit, push, PR via `gh`. |
 | M4 | Cross-agent hand-off (user-initiated) and the local MCP `hearth.handoff` tool with sub-threads. |
 | M5 | Performance pass against all budgets, local usage view, export diagnostics, signed and notarized build for the author's own Macs. |
 
-**v1 is done when:** every §3 item works on a clean Mac with only `claude`, `codex`, `git`, and `gh` installed and signed in; every §6 CI gate is green; and every §7 budget passes in CI.
+**v1 is done when:** every §3 item works on a clean Mac with only `claude`, `qwen`, `git`, and `gh` installed and signed in (or, for Qwen Code, set up with the user's own provider key); every §6 CI gate is green; and every §7 budget passes in CI.
 
 ---
 
