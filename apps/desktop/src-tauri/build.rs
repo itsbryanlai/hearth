@@ -6,6 +6,7 @@ fn main() {
             "list_projects",
             "add_project",
             "list_threads",
+            "worktree_info",
             "create_thread",
             "load_thread",
             "list_thread_models",

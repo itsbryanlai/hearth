@@ -10,6 +10,7 @@
     "allow-list-projects",
     "allow-add-project",
     "allow-list-threads",
+    "allow-worktree-info",
     "allow-create-thread",
     "allow-load-thread",
     "allow-list-thread-models",

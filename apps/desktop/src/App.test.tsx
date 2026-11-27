@@ -6,7 +6,7 @@ import type { InstalledAgent, Ipc, ThreadEventPayload, ThreadModels, ThreadSnaps
 import { createMockIpc } from "./ipc/mock";
 import { createAppStore, nextFrame } from "./state/store";
 
-const THREAD = { id: "th", projectId: "p", title: "Thread one", agent: "claude-code", model: "opus" };
+const THREAD = { id: "th", projectId: "p", title: "Thread one", agent: "claude-code", model: "opus", branch: null };
 
 beforeEach(() => {
   // jsdom has no layout: give every element a size so the virtualizer has a viewport.
@@ -56,6 +56,7 @@ function fakeIpc(snapshot: ThreadSnapshot = { thread: THREAD, turns: [], lastSeq
     listProjects: vi.fn(async () => [{ id: "p", name: "proj", path: "/work/proj" }]),
     addProject: vi.fn(),
     listThreads: vi.fn(async () => [THREAD]),
+    worktreeInfo: vi.fn<Ipc["worktreeInfo"]>(async () => ({ isGit: false, base: null, reason: null })),
     createThread: vi.fn(),
     loadThread: vi.fn(async () => snapshot),
     listThreadModels: vi.fn(async (): Promise<ThreadModels> => ({ choices: [], selected: null, current: null })),
@@ -323,10 +324,29 @@ test.each([
       expect(within(selector).getByRole("option", { name: /Claude Code.*unsupported version 1.0.0/ }))
         .toHaveProperty("disabled", true);
     }
+    await vi.waitFor(() => expect(screen.getByRole("button", { name: "Create thread" })).not.toHaveProperty("disabled", true));
     fireEvent.click(screen.getByRole("button", { name: "Create thread" }));
-    await vi.waitFor(() => expect(ipc.createThread).toHaveBeenCalledWith("p", expected));
+    await vi.waitFor(() => expect(ipc.createThread).toHaveBeenCalledWith("p", expected, null));
   },
 );
+
+// Fails if a single ready agent bypasses the directory choice or the selected base.
+test.each([
+  { mode: "worktree", expected: "topic" },
+  { mode: "repo", expected: null },
+])("new thread uses the selected $mode directory", async ({ mode, expected }) => {
+  const { ipc } = fakeIpc();
+  ipc.worktreeInfo.mockResolvedValue({ isGit: true, base: "main", reason: null });
+  ipc.createThread.mockResolvedValue(THREAD);
+  render(<App store={createAppStore(ipc)} />);
+  fireEvent.click(await screen.findByRole("button", { name: "+ Thread" }));
+  const directory = await screen.findByRole("combobox", { name: "Working directory" });
+  expect(directory).toHaveProperty("value", "worktree");
+  fireEvent.change(screen.getByRole("textbox", { name: "Base" }), { target: { value: "topic" } });
+  if (mode === "repo") fireEvent.change(directory, { target: { value: "repo" } });
+  fireEvent.click(screen.getByRole("button", { name: "Create thread" }));
+  await vi.waitFor(() => expect(ipc.createThread).toHaveBeenCalledWith("p", CLAUDE.id, expected));
+});
 
 // Fails if an agent without a known approval scope offers a remembered approval.
 test("an unscoped approval only offers one-shot choices", async () => {

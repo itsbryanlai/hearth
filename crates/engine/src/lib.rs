@@ -9,6 +9,6 @@ mod engine;
 
 pub use api::{
     AgentStatus, EngineError, EventSink, InstalledAgent, Project, ThreadEventPayload, ThreadModels,
-    ThreadSnapshot, ThreadSummary, TurnSnapshot,
+    ThreadSnapshot, ThreadSummary, TurnSnapshot, WorktreeInfo,
 };
 pub use engine::{Engine, EngineConfig};

@@ -5,14 +5,14 @@ use crate::agents::{
 };
 use crate::api::{
     AgentStatus, EngineError, EventSink, InstalledAgent, Project, ThreadEventPayload, ThreadModels,
-    ThreadSnapshot, ThreadSummary, TurnSnapshot,
+    ThreadSnapshot, ThreadSummary, TurnSnapshot, WorktreeInfo,
 };
 use crate::coalesce::coalesce;
 use hearth_core::fsguard::FsGuard;
 use hearth_core::store::{self, NewEvent, NewThread, Store, ThreadStatus, TurnRole};
 use hearth_protocol::{
-    AgentEvent, AgentId, ApprovalDecision, ApprovalId, ApprovalRequest, PermissionMode, ProjectId,
-    StopReason, ThreadId, TurnId, UserInput,
+    AgentEvent, AgentId, ApprovalDecision, ApprovalId, ApprovalRequest, ProjectId, StopReason,
+    ThreadId, TurnId, UserInput,
 };
 use serde_json::{Value, json};
 use std::collections::{HashMap, hash_map::Entry};
@@ -113,6 +113,7 @@ fn thread_summary(store: &Store, t: &store::Thread) -> Result<ThreadSummary, Eng
             .as_ref()
             .map_or(AgentId::QwenCode, |s| s.agent.clone()),
         model: session.map(|s| s.model).unwrap_or_default(),
+        branch: t.branch.clone(),
     })
 }
 
@@ -145,12 +146,19 @@ impl Engine {
             store.update_thread_status(&thread, ThreadStatus::Idle)?;
         }
         let mut roots = config.roots;
-        roots.extend(
-            store
-                .list_projects()?
-                .into_iter()
-                .map(|p| PathBuf::from(p.path)),
-        );
+        for project in store.list_projects()? {
+            let project_path = PathBuf::from(&project.path);
+            for thread in store.list_threads(&project.id)? {
+                if let Some(path) = thread.worktree_path.as_deref()
+                    && thread.cwd == path
+                    && let Ok(path) =
+                        hearth_core::git::validate(&project_path, &config.home, Path::new(path))
+                {
+                    roots.push(path);
+                }
+            }
+            roots.push(project_path);
+        }
         Ok(Self {
             inner: Arc::new(Inner {
                 store: Mutex::new(store),
@@ -242,11 +250,43 @@ impl Engine {
             .ok_or_else(|| EngineError("This agent is not supported.".into()))
     }
 
-    /// The thread works in the project's folder (worktrees come later).
+    pub fn worktree_info(&self, project: &ProjectId) -> Result<WorktreeInfo, EngineError> {
+        let project = lock(&self.inner.store)
+            .list_projects()?
+            .into_iter()
+            .find(|p| p.id == *project)
+            .ok_or("unknown project")?;
+        lock(&self.inner.guard)
+            .try_check(Path::new(&project.path))
+            .map_err(|e| EngineError(e.to_string()))?;
+        let path = Path::new(&project.path);
+        match hearth_core::git::project_root(path, &self.inner.home) {
+            Ok(_) => Ok(WorktreeInfo {
+                is_git: true,
+                base: hearth_core::git::base(path, &self.inner.home).ok(),
+                reason: None,
+            }),
+            Err(reason) => Ok(WorktreeInfo {
+                is_git: false,
+                base: None,
+                reason: (reason != "This project has no Git metadata.").then_some(reason),
+            }),
+        }
+    }
+
     pub async fn create_thread(
         &self,
         project: &ProjectId,
         agent: AgentId,
+    ) -> Result<ThreadSummary, EngineError> {
+        self.create_thread_in(project, agent, None).await
+    }
+
+    pub async fn create_thread_in(
+        &self,
+        project: &ProjectId,
+        agent: AgentId,
+        base: Option<String>,
     ) -> Result<ThreadSummary, EngineError> {
         let registered = self.registration(&agent)?;
         match registered.adapter.availability().await {
@@ -261,25 +301,86 @@ impl Engine {
                 )));
             }
         }
-        let mut store = lock(&self.inner.store);
-        let project = store
+        let project = lock(&self.inner.store)
             .list_projects()?
             .into_iter()
             .find(|p| p.id == *project)
             .ok_or("unknown project")?;
         lock(&self.inner.guard)
             .try_check(Path::new(&project.path))
-            .map_err(|d| EngineError(d.to_string()))?;
-        let thread = store.create_thread(
-            &project.id,
-            NewThread {
-                title: NEW_THREAD_TITLE,
-                cwd: &project.path,
-                ..Default::default()
-            },
-        )?;
-        store.start_agent_session(&thread.id, &agent, "", PermissionMode::Default, None)?;
-        thread_summary(&store, &thread)
+            .map_err(|e| EngineError(e.to_string()))?;
+        let worktree = if let Some(base) = base {
+            let path = PathBuf::from(&project.path);
+            let home = self.inner.home.clone();
+            Some(
+                tokio::task::spawn_blocking(move || hearth_core::git::create(&path, &home, &base))
+                    .await
+                    .map_err(|e| EngineError(e.to_string()))?
+                    .map_err(EngineError)?,
+            )
+        } else {
+            None
+        };
+        let cwd = worktree.as_ref().map_or_else(
+            || project.path.clone(),
+            |w| w.path.to_string_lossy().into_owned(),
+        );
+        let result = {
+            let mut store = lock(&self.inner.store);
+            store
+                .create_thread_with_session(
+                    &project.id,
+                    NewThread {
+                        title: NEW_THREAD_TITLE,
+                        cwd: &cwd,
+                        worktree_path: worktree.as_ref().map(|_| cwd.as_str()),
+                        branch: worktree.as_ref().map(|w| w.branch.as_str()),
+                        base_ref: worktree.as_ref().map(|w| w.base.as_str()),
+                    },
+                    &agent,
+                )
+                .map_err(EngineError::from)
+                .map(|thread| ThreadSummary {
+                    id: thread.id,
+                    project_id: thread.project_id,
+                    title: thread.title,
+                    agent: agent.clone(),
+                    model: String::new(),
+                    branch: thread.branch,
+                })
+        };
+        match result {
+            Ok(summary) => {
+                if let Some(worktree) = worktree {
+                    let project_path = PathBuf::from(&project.path);
+                    let path = worktree.path.clone();
+                    let home = self.inner.home.clone();
+                    let root = tokio::task::spawn_blocking(move || {
+                        hearth_core::git::validate(&project_path, &home, &path)
+                    })
+                    .await
+                    .map_err(|e| EngineError(e.to_string()))?
+                    .map_err(|e| {
+                        EngineError(format!(
+                            "Thread was saved but its worktree cannot be opened at {}: {e}",
+                            worktree.path.display()
+                        ))
+                    })?;
+                    lock(&self.inner.guard).add_root(&root);
+                }
+                Ok(summary)
+            }
+            Err(error) => {
+                if let Some(worktree) = worktree {
+                    return Err(EngineError(format!(
+                        "{error}; thread was not saved. The worktree at {} and branch {} may be removed after inspection.",
+                        worktree.path.display(),
+                        worktree.branch
+                    )));
+                }
+                Err(EngineError(error.to_string()))
+            }
+        }
     }
 
     /// The thread as stored; the agent's own replay is not used for display.

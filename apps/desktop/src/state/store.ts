@@ -37,7 +37,8 @@ export type AppState = {
   error: string | null;
   init(): Promise<void>;
   addProject(path: string): Promise<void>;
-  createThread(projectId: string, agent?: AgentId): Promise<void>;
+  worktreeInfo(projectId: string): Promise<{ isGit: boolean; base: string | null; reason: string | null }>;
+  createThread(projectId: string, agent: AgentId, base: string | null): Promise<void>;
   selectThread(threadId: string): Promise<void>;
   loadModels(threadId: string): Promise<void>;
   setModel(threadId: string, modelId: string): Promise<void>;
@@ -54,7 +55,6 @@ export type AppStore = StoreApi<AppState>;
 type Options = {
   /** Schedules one callback for the next animation frame. */
   raf?: (cb: () => void) => void;
-  defaultAgent?: AgentId;
 };
 
 /**
@@ -75,7 +75,6 @@ export function nextFrame(cb: () => void): void {
 
 export function createAppStore(ipc: Ipc, options: Options = {}): AppStore {
   const raf = options.raf ?? nextFrame;
-  const defaultAgent = options.defaultAgent ?? "qwen-code";
 
   // Events wait here and are applied together, once per frame, however many arrive.
   let buffer: ThreadEventPayload[] = [];
@@ -186,9 +185,10 @@ export function createAppStore(ipc: Ipc, options: Options = {}): AppStore {
           fail(e);
         }
       },
-      async createThread(projectId, agent = defaultAgent) {
+      worktreeInfo: (projectId) => ipc.worktreeInfo(projectId),
+      async createThread(projectId, agent, base) {
         try {
-          const thread = await ipc.createThread(projectId, agent);
+          const thread = await ipc.createThread(projectId, agent, base);
           set((s) => ({
             threads: { ...s.threads, [projectId]: [...(s.threads[projectId] ?? []), thread] },
             transcripts: { ...s.transcripts, [thread.id]: emptyTranscript },

@@ -102,6 +102,101 @@ impl FsGuard {
         }
     }
 
+    /// Check one component of a project's sibling worktree directory without
+    /// enrolling its parent as a readable root.
+    pub fn worktree_component(
+        &self,
+        project: &Path,
+        path: &Path,
+        create: bool,
+        absent: bool,
+    ) -> Result<(), String> {
+        let project = self.try_check(project).map_err(|e| e.to_string())?;
+        let project = project.as_path();
+        let top = project
+            .parent()
+            .ok_or("Project has no parent")?
+            .join(".hearth-worktrees");
+        let parent = top.join(project.file_name().ok_or("Project has no name")?);
+        if path != top && path != parent && path.parent() != Some(parent.as_path()) {
+            return Err("Invalid worktree destination".into());
+        }
+        let canonical_parent = path
+            .parent()
+            .ok_or("Invalid destination")?
+            .canonicalize()
+            .map_err(|e| e.to_string())?;
+        if self.in_denylist(path) || self.in_denylist(&canonical_parent) {
+            return Err("Worktree destination is protected".into());
+        }
+        match std::fs::symlink_metadata(path) {
+            Ok(_) if absent => return Err("Worktree destination already exists".into()),
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(format!("Symlink refused: {}", path.display()));
+            }
+            Ok(meta) if !meta.is_dir() => {
+                return Err(format!("Not a directory: {}", path.display()));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound && create => {
+                std::fs::create_dir(path).map_err(|e| e.to_string())?
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound && absent => return Ok(()),
+            Err(e) => return Err(e.to_string()),
+        }
+        let canonical = path.canonicalize().map_err(|e| e.to_string())?;
+        if self.in_denylist(&canonical) {
+            return Err("Worktree destination is protected".into());
+        }
+        Ok(())
+    }
+
+    /// Resolve Git's metadata and common directory before Git can inspect them.
+    /// Both must be inside the owning project's existing allowlist.
+    pub fn git_metadata(&self, cwd: &Path, owner: &FsGuard) -> Result<bool, String> {
+        let cwd = self.try_check(cwd).map_err(|e| e.to_string())?;
+        let dotgit = cwd.as_path().join(".git");
+        let meta = match std::fs::symlink_metadata(&dotgit) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e.to_string()),
+        };
+        if meta.file_type().is_symlink() {
+            return Err("Git metadata symlinks are not supported for worktrees.".into());
+        }
+        let gitdir = if meta.is_dir() {
+            dotgit
+        } else if meta.is_file() {
+            let contents = self.read_to_string(&dotgit).map_err(|e| e.to_string())?;
+            let target = contents
+                .trim()
+                .strip_prefix("gitdir: ")
+                .ok_or("Invalid Git metadata file")?;
+            cwd.as_path().join(target)
+        } else {
+            return Err("Invalid Git metadata".into());
+        };
+        let protected = || {
+            "Git metadata outside the project is not supported for new worktrees. Work in repo remains available.".to_owned()
+        };
+        let gitdir = owner.try_check(&gitdir).map_err(|_| protected())?;
+        let common_file = gitdir.as_path().join("commondir");
+        match std::fs::symlink_metadata(&common_file) {
+            Ok(meta) if meta.is_file() => {
+                let common = owner
+                    .read_to_string(&common_file)
+                    .map_err(|_| protected())?;
+                owner
+                    .try_check(&gitdir.as_path().join(common.trim()))
+                    .map_err(|_| protected())?;
+            }
+            Ok(_) => return Err("Invalid Git common directory metadata".into()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.to_string()),
+        }
+        Ok(true)
+    }
+
     /// The verdict without the debug panic. Prefer [`FsGuard::check`].
     pub fn try_check(&self, path: &Path) -> Result<CanonicalPath, Denied> {
         let canon = path
