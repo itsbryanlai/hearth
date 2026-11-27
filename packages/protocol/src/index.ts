@@ -1,0 +1,21 @@
+// Re-exports the generated protocol types. Regenerate: see crates/protocol/src/lib.rs.
+export type { AgentEvent } from "./generated/AgentEvent";
+export type { AgentId } from "./generated/AgentId";
+export type { AgentSessionId } from "./generated/AgentSessionId";
+export type { ApprovalDecision } from "./generated/ApprovalDecision";
+export type { ApprovalId } from "./generated/ApprovalId";
+export type { ApprovalOption } from "./generated/ApprovalOption";
+export type { ApprovalOptionKind } from "./generated/ApprovalOptionKind";
+export type { ApprovalRequest } from "./generated/ApprovalRequest";
+export type { EventId } from "./generated/EventId";
+export type { FileEditKind } from "./generated/FileEditKind";
+export type { Model } from "./generated/Model";
+export type { PermissionMode } from "./generated/PermissionMode";
+export type { ProjectId } from "./generated/ProjectId";
+export type { StopReason } from "./generated/StopReason";
+export type { ThreadId } from "./generated/ThreadId";
+export type { TokenUsage } from "./generated/TokenUsage";
+export type { ToolKind } from "./generated/ToolKind";
+export type { ToolStatus } from "./generated/ToolStatus";
+export type { TurnId } from "./generated/TurnId";
+export type { UserInput } from "./generated/UserInput";

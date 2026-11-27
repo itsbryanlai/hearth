@@ -12,7 +12,8 @@ run_case() {
   mkdir -p "$dir/scripts"
   cp "$ROOT/scripts/privacy-gates.sh" "$ROOT/scripts/privacy-allowlist.txt" "$dir/scripts/"
   (cd "$dir" && git init -q && "$setup")
-  out=$(cd "$dir" && git add -A && bash scripts/privacy-gates.sh 2>&1); rc=$?
+  local add="git add -A"; [[ $setup == *_untracked ]] && add=":"   # *_untracked cases never stage their files
+  out=$(cd "$dir" && $add && bash scripts/privacy-gates.sh 2>&1); rc=$?
   if [[ $rc -eq $want && $out == *"$line"* ]]; then
     echo "PASS: $name"; pass=$((pass + 1))
   else
@@ -44,6 +45,7 @@ s_rust_ok() {
 s_host_bad() { mkdir -p apps/ui; echo 'const u = "https://example.com/x";' > apps/ui/a.ts; }
 s_host_csp() { mkdir -p apps/ui; echo '"csp": "connect-src ipc: http://ipc.localhost; img-src data:"' > apps/ui/a.json; }
 s_host_semicolon_bad() { mkdir -p apps/ui; echo '"csp": "connect-src https://evil.example; img-src data:"' > apps/ui/a.json; }
+s_host_bad_untracked() { mkdir -p apps/ui; echo 'const u = "https://example.com/x";' > apps/ui/new.ts; }
 s_host_allowed() { mkdir -p apps/ui; echo "csp: connect-src ipc: http://ipc.localhost" > apps/ui/a.ts; }
 s_host_md() { mkdir -p apps/ui; echo 'See https://example.com/docs' > apps/ui/README.md; }
 
@@ -58,6 +60,7 @@ run_case "hard-coded https://example.com in apps/ fails"       s_host_bad       
 run_case "allowlisted http://ipc.localhost passes"             s_host_allowed   0 "privacy gates: ok"
 run_case "allowlisted host followed by ; in a CSP passes"      s_host_csp       0 "privacy gates: ok"
 run_case "remote host followed by ; in a CSP fails"           s_host_semicolon_bad 1 "hard-coded host 'https://evil.example'"
+run_case "hard-coded host in a not-yet-added file fails"       s_host_bad_untracked 1 "hard-coded host 'https://example.com/x'"
 run_case "URL inside a .md file passes"                        s_host_md        0 "privacy gates: ok"
 
 echo "total: $pass passed, $failn failed"
