@@ -12,9 +12,12 @@
     "tauri": "tauri"
   },
   "dependencies": {
+    "@hearth/protocol": "workspace:*",
+    "@tanstack/react-virtual": "3.14.28",
     "@tauri-apps/api": "2.12.5",
     "react": "19.3.1",
-    "react-dom": "19.3.1"
+    "react-dom": "19.3.1",
+    "zustand": "5.1.0"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
