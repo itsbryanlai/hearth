@@ -7,8 +7,8 @@ Rules for anyone (human or agent) changing Hearth. The design is in [docs/spec.m
 ### Privacy (spec §6). These are never traded for convenience.
 
 1. **No telemetry, analytics, crash reporting or usage pings.** No code for them, and no dependency that provides them.
-2. **Hearth's own processes make no network requests.** Rust core crates take no HTTP or WebSocket client crate. UI code uses no `fetch`, `XMLHttpRequest`, `WebSocket` or `EventSource`, and loads no remote origin. The webview CSP stays closed. Network traffic comes only from `claude`, `codex`, `git` and `gh`, which the user runs and signs in to.
-3. **Never read agent credential or config files**: `~/.claude*`, `~/.codex/`, `~/.config/gh`, `~/.ssh`, keychains. All core file access goes through the file-access guard (an allowlist of project dirs, their worktrees and the Hearth data dir).
+2. **Hearth's own processes make no network requests.** Rust core crates take no HTTP or WebSocket client crate. UI code uses no `fetch`, `XMLHttpRequest`, `WebSocket` or `EventSource`, and loads no remote origin. The webview CSP stays closed. Network traffic comes only from `claude`, `qwen`, `git` and `gh`, which the user runs and signs in to.
+3. **Never read agent credential or config files**: `~/.claude*`, `~/.qwen/`, `~/.codex/`, `~/.config/gh`, `~/.ssh`, keychains. All core file access goes through the file-access guard (an allowlist of project dirs, their worktrees and the Hearth data dir).
 4. **No identifiers.** No install ID, device ID, account ID or fingerprint is generated or stored.
 5. **All data is local** in the Hearth data dir and deletable from Settings. Diagnostics are exported only by the user, to a local file they see first.
 6. **Nothing is pushed, committed or opened** on a remote without an explicit user action.
