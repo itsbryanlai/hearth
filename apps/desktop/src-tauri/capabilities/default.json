@@ -1,10 +1,20 @@
 {
   "identifier": "default",
-  "description": "Hearth's own IPC only: no plugins, no http, shell or fs.",
+  "description": "Hearth's own IPC only: its commands and the event listener. No plugins, no http, shell or fs.",
   "windows": [
     "main"
   ],
   "permissions": [
-    "allow-app-version"
+    "allow-app-version",
+    "allow-list-projects",
+    "allow-add-project",
+    "allow-list-threads",
+    "allow-create-thread",
+    "allow-load-thread",
+    "allow-send-message",
+    "allow-answer-approval",
+    "allow-cancel-turn",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten"
   ]
 }

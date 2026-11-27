@@ -4,7 +4,7 @@ import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { App } from "./App";
 import type { Ipc, ThreadEventPayload, ThreadSnapshot } from "./ipc/contract";
 import { createMockIpc } from "./ipc/mock";
-import { createAppStore } from "./state/store";
+import { createAppStore, nextFrame } from "./state/store";
 
 const THREAD = { id: "th", projectId: "p", title: "Thread one", agent: "claude-code", model: "opus" };
 
@@ -36,7 +36,7 @@ function frames() {
   };
 }
 
-function fakeIpc(snapshot: ThreadSnapshot = { thread: THREAD, turns: [] }) {
+function fakeIpc(snapshot: ThreadSnapshot = { thread: THREAD, turns: [], lastSeq: 0 }) {
   let emit: (p: ThreadEventPayload) => void = () => {};
   const ipc = {
     listProjects: vi.fn(async () => [{ id: "p", name: "proj", path: "/work/proj" }]),
@@ -129,6 +129,7 @@ test("a 10,000-event thread keeps fewer than 100 rows in the DOM", async () => {
   const { ipc } = fakeIpc({
     thread: THREAD,
     turns: [{ turnId: "t1", agent: "claude-code", model: "opus", input: { kind: "text", text: "hi" }, events }],
+    lastSeq: events.length,
   });
   await openThread(ipc);
   const rows = document.querySelectorAll(".transcript .row");
@@ -163,4 +164,21 @@ test("the mock backend drives a thread from send to the end of the turn", async 
   drain();
   expect(await screen.findByText(/passes ten runs in a row/)).toBeTruthy();
   expect(screen.queryByRole("button", { name: "Stop" })).toBeNull();
+});
+
+// Fails if events wait for an animation frame that a hidden window never gets,
+// or if the callback runs twice when both the frame and the timer fire.
+test("the frame scheduler falls back to a timer and runs once", () => {
+  vi.useFakeTimers();
+  const frameCbs: FrameRequestCallback[] = [];
+  vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => frameCbs.push(cb));
+  const cb = vi.fn();
+  nextFrame(cb);
+  expect(cb).not.toHaveBeenCalled();
+  vi.advanceTimersByTime(100);
+  expect(cb).toHaveBeenCalledTimes(1);
+  frameCbs.forEach((f) => f(0));
+  expect(cb).toHaveBeenCalledTimes(1);
+  vi.unstubAllGlobals();
+  vi.useRealTimers();
 });

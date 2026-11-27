@@ -143,7 +143,11 @@ export function createMockIpc(options: Options = {}): Ipc {
     async loadThread(threadId): Promise<ThreadSnapshot> {
       const thread = threads.find((t) => t.id === threadId);
       if (!thread) throw new Error(`unknown thread ${threadId}`);
-      return { thread, turns: (turns.get(threadId) ?? []).map((t) => ({ ...t, events: [...t.events] })) };
+      return {
+        thread,
+        turns: (turns.get(threadId) ?? []).map((t) => ({ ...t, events: [...t.events] })),
+        lastSeq: seqs.get(threadId) ?? 0,
+      };
     },
     async sendMessage(threadId, input) {
       const thread = threads.find((t) => t.id === threadId);

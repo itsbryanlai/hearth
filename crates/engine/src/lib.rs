@@ -1,0 +1,14 @@
+//! Hearth's engine: owns the store, the file-access guard and one live agent
+//! session per thread, and exposes the UI's operations. It has no UI
+//! framework dependency; the app supplies an [`EventSink`].
+
+pub mod agents;
+mod api;
+mod coalesce;
+mod engine;
+
+pub use api::{
+    EngineError, EventSink, Project, ThreadEventPayload, ThreadSnapshot, ThreadSummary,
+    TurnSnapshot,
+};
+pub use engine::{Engine, EngineConfig};

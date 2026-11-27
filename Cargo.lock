@@ -1299,8 +1299,23 @@ name = "hearth-desktop"
 version = "0.1.0"
 dependencies = [
  "hearth-core",
+ "hearth-engine",
+ "hearth-protocol",
  "tauri",
  "tauri-build",
+]
+
+[[package]]
+name = "hearth-engine"
+version = "0.1.0"
+dependencies = [
+ "hearth-adapter-qwen",
+ "hearth-core",
+ "hearth-protocol",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
