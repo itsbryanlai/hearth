@@ -1273,6 +1273,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hearth-adapter-claude"
+version = "0.1.0"
+dependencies = [
+ "hearth-protocol",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "hearth-adapter-qwen"
 version = "0.1.0"
 dependencies = [
