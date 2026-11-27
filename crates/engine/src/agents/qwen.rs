@@ -3,13 +3,19 @@
 //! allowlist plus the variable names the user chose, with values taken from
 //! the login shell. No value is ever logged, stored or emitted.
 
-use super::AgentLauncher;
+use super::{AgentAdapter, AgentFuture, AgentItem, AgentSession, AgentStream, OpenSession};
+use hearth_adapter_qwen::QwenProcess;
 use hearth_adapter_qwen::SpawnConfig;
+use hearth_protocol::{AgentEvent, ApprovalDecision, ApprovalRequest, UserInput};
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 /// Variables passed on from Hearth's own environment (only those present).
@@ -210,6 +216,143 @@ impl AgentLauncher for QwenLauncher {
         let mut config = SpawnConfig::qwen_defaults(program, cwd);
         config.env = spawn_env(&host, &login, passthrough);
         Ok(config)
+    }
+}
+
+/// Supplies Qwen's spawn policy on a blocking thread.
+pub trait AgentLauncher: Send + Sync {
+    fn spawn_config(&self, cwd: &Path, passthrough: &[String]) -> Result<SpawnConfig, String>;
+}
+
+/// Opens Qwen sessions using the supplied launch policy.
+pub struct QwenAdapter(pub Arc<dyn AgentLauncher>);
+
+impl AgentAdapter for QwenAdapter {
+    fn open_session<'a>(
+        &'a self,
+        cwd: &'a Path,
+        resume_id: Option<&'a str>,
+        passthrough: &'a [String],
+    ) -> AgentFuture<'a, Result<OpenSession, String>> {
+        Box::pin(async move {
+            let launcher = self.0.clone();
+            let spawn_cwd = cwd.to_path_buf();
+            let names = passthrough.to_vec();
+            let config =
+                tokio::task::spawn_blocking(move || launcher.spawn_config(&spawn_cwd, &names))
+                    .await
+                    .map_err(|e| e.to_string())??;
+            let process = QwenProcess::spawn(config).map_err(|e| e.to_string())?;
+            process
+                .initialize()
+                .await
+                .map_err(|e| with_auth_hint(&e.to_string()))?;
+            let resumed = match resume_id {
+                Some(id) => process
+                    .load_session(id, cwd)
+                    .await
+                    .ok()
+                    .map(|s| (id.to_owned(), s.models)),
+                None => None,
+            };
+            let had_session = resumed.is_some();
+            let (external_id, models) = match resumed {
+                Some(value) => value,
+                None => process
+                    .new_session(cwd)
+                    .await
+                    .map_err(|e| with_auth_hint(&e.to_string()))?,
+            };
+            let model = models
+                .current
+                .or_else(|| models.available.first().map(|m| m.id.clone()))
+                .unwrap_or_default();
+            Ok(OpenSession {
+                session: Arc::new(QwenSession {
+                    process,
+                    turn_done: Arc::new(AtomicBool::new(had_session)),
+                }),
+                external_id: Some(external_id),
+                model: Some(model),
+            })
+        })
+    }
+}
+
+struct QwenSession {
+    process: QwenProcess,
+    turn_done: Arc<AtomicBool>,
+}
+impl AgentSession for QwenSession {
+    fn prompt(&self, input: UserInput) -> Box<dyn AgentStream> {
+        Box::new(QwenStream {
+            source: self.process.prompt(input),
+            done: self.turn_done.clone(),
+        })
+    }
+    fn turn_completed(&self) {
+        self.turn_done.store(true, Ordering::Relaxed);
+    }
+    fn answer_approval<'a>(
+        &'a self,
+        request: &'a ApprovalRequest,
+        decision: ApprovalDecision,
+    ) -> AgentFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            self.process
+                .answer_permission(request, decision)
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+    fn cancel(&self) -> AgentFuture<'_, Result<(), String>> {
+        Box::pin(async move { self.process.cancel().await.map_err(|e| e.to_string()) })
+    }
+}
+
+struct QwenStream {
+    source: hearth_adapter_qwen::AdapterStream,
+    done: Arc<AtomicBool>,
+}
+impl AgentStream for QwenStream {
+    fn poll_next(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<AgentItem>> {
+        self.source.poll_next(cx).map(|item| {
+            item.map(|mut item| {
+                if let AgentEvent::Error { message } = &mut item.event
+                    && !self.done.load(Ordering::Relaxed)
+                {
+                    *message = with_auth_hint(message);
+                }
+                AgentItem {
+                    event: item.event,
+                    raw: item.raw,
+                }
+            })
+        })
+    }
+}
+
+/// An authentication failure gets the way out appended.
+fn with_auth_hint(message: &str) -> String {
+    let lower = message.to_lowercase();
+    let auth = [
+        "auth",
+        "api key",
+        "api_key",
+        "apikey",
+        "unauthorized",
+        "401",
+        "credential",
+        "log in",
+        "login",
+        "sign in",
+    ];
+    if auth.iter().any(|k| lower.contains(k)) {
+        format!(
+            "{message} Run `qwen` in your terminal to set up the provider key, or add the key's variable name in Settings."
+        )
+    } else {
+        message.to_owned()
     }
 }
 

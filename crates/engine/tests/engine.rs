@@ -1,7 +1,7 @@
 //! The engine against the replay stub (`qwen-replay`) and a real store.
 
 use hearth_adapter_qwen::SpawnConfig;
-use hearth_engine::agents::AgentLauncher;
+use hearth_engine::agents::qwen::AgentLauncher;
 use hearth_engine::{Engine, EngineConfig, EventSink, ThreadEventPayload};
 use hearth_protocol::{AgentEvent, AgentId, ApprovalDecision, StopReason, ThreadId, UserInput};
 use std::path::{Path, PathBuf};
@@ -86,7 +86,9 @@ fn engine(
             db_path: Some(w.db.clone()),
             home: w.home.clone(),
             roots: vec![],
-            launcher: Arc::new(ReplayLauncher(fixture_path)),
+            launcher: Arc::new(hearth_engine::agents::qwen::QwenAdapter(Arc::new(
+                ReplayLauncher(fixture_path),
+            ))),
         },
         Arc::new(ChannelSink(tx)),
     )

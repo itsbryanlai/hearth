@@ -1,6 +1,6 @@
 //! Merges runs of streaming deltas so one batch is one event per run.
 
-use hearth_adapter_qwen::AdapterItem;
+use crate::agents::AgentItem;
 use hearth_core::store::NewEvent;
 use hearth_protocol::AgentEvent;
 use serde_json::Value;
@@ -8,7 +8,7 @@ use serde_json::Value;
 /// Adjacent text deltas, adjacent reasoning deltas and adjacent output of one
 /// tool call become one event with the texts joined. A merged event keeps
 /// every source payload as an array in `raw`.
-pub(crate) fn coalesce(items: Vec<AdapterItem>) -> Vec<NewEvent> {
+pub(crate) fn coalesce(items: Vec<AgentItem>) -> Vec<NewEvent> {
     let mut out: Vec<(AgentEvent, Vec<Value>)> = Vec::new();
     for item in items {
         if let Some((last, raws)) = out.last_mut() {
@@ -58,16 +58,16 @@ mod tests {
     use hearth_protocol::StopReason;
     use serde_json::json;
 
-    fn item(event: AgentEvent) -> AdapterItem {
-        AdapterItem {
+    fn item(event: AgentEvent) -> AgentItem {
+        AgentItem {
             event,
             raw: json!({}),
         }
     }
-    fn text(t: &str) -> AdapterItem {
+    fn text(t: &str) -> AgentItem {
         item(AgentEvent::TextDelta { text: t.into() })
     }
-    fn thought(t: &str) -> AdapterItem {
+    fn thought(t: &str) -> AgentItem {
         item(AgentEvent::ReasoningDelta { text: t.into() })
     }
 
