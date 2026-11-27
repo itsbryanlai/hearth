@@ -222,6 +222,76 @@ impl FsGuard {
         verdict
     }
 
+    /// Read an ordinary file beneath an allowed directory without following symlinks.
+    /// Each component is opened relative to an already-open directory, so a
+    /// replacement between validation and the read cannot redirect the open.
+    #[cfg(unix)]
+    pub fn read_file_no_symlinks(
+        &self,
+        root: &Path,
+        relative: &Path,
+    ) -> Result<(std::fs::File, bool), FsError> {
+        use rustix::fs::{Mode, OFlags, open, openat};
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::Component;
+
+        let checked = self.try_check(root)?;
+        if checked.as_path().as_os_str() != root.as_os_str() {
+            return Err(FsError::Denied(Denied::OutsideRoots(root.to_path_buf())));
+        }
+        let root = checked;
+        let normalized: std::path::PathBuf = relative.components().collect();
+        if normalized.as_os_str() != relative.as_os_str() {
+            return Err(FsError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "noncanonical relative path",
+            )));
+        }
+        if relative.as_os_str().is_empty()
+            || relative
+                .components()
+                .any(|c| !matches!(c, Component::Normal(_)))
+        {
+            return Err(FsError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid relative path",
+            )));
+        }
+        let path = root.as_path().join(relative);
+        if self.in_denylist(&path) {
+            return Err(FsError::Denied(Denied::Denylist(path)));
+        }
+        let mut dir = open(
+            "/",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(io::Error::from)?;
+        let mut parts = path
+            .components()
+            .filter_map(|c| match c {
+                Component::Normal(p) => Some(p),
+                _ => None,
+            })
+            .peekable();
+        while let Some(part) = parts.next() {
+            let mut flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
+            if parts.peek().is_some() {
+                flags |= OFlags::DIRECTORY;
+            }
+            dir = openat(&dir, part, flags, Mode::empty()).map_err(io::Error::from)?;
+        }
+        let file = std::fs::File::from(dir);
+        let meta = file.metadata()?;
+        if !meta.is_file() {
+            return Err(FsError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not an ordinary file",
+            )));
+        }
+        Ok((file, meta.permissions().mode() & 0o111 != 0))
+    }
+
     pub fn read_to_string(&self, path: &Path) -> Result<String, FsError> {
         let p = self.check(path)?;
         Ok(std::fs::read_to_string(p.as_path())?)

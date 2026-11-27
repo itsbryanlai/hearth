@@ -2,6 +2,7 @@
 
 pub mod fsguard;
 pub mod git;
+pub mod snapshot;
 pub mod store;
 
 /// The version of Hearth, as set in the workspace manifest.
