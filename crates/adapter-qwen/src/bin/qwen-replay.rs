@@ -6,7 +6,8 @@
 //! method (recognised from the response's shape). Inside a segment, lines go
 //! out in order. An agent request for permission waits for the client's
 //! answer; a final `cancelled` stop reason waits for `session/cancel`, and an
-//! answer of `cancelled` skips to the end of the turn as a cancelled one.
+//! answer of `cancelled` skips to the end of the turn as a cancelled one. A
+//! final stop reason of `hang` is never answered (an agent that ignores cancel).
 //!
 //! Debug methods, for tests: `stub/received` returns every client message
 //! seen so far (method and params, or the result of a response);
@@ -82,6 +83,10 @@ impl Stub {
             if is_response {
                 line["id"] = request_id.clone();
                 if line.pointer("/result/stopReason").is_some() {
+                    if line.pointer("/result/stopReason") == Some(&json!("hang")) {
+                        while self.read().is_some() {}
+                        return;
+                    }
                     if cancelled {
                         line["result"]["stopReason"] = json!("cancelled");
                     } else if line.pointer("/result/stopReason") == Some(&json!("cancelled")) {

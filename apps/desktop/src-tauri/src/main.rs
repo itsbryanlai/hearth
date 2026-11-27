@@ -59,7 +59,7 @@ async fn send_message(
     engine: State<'_, Engine>,
     thread_id: ThreadId,
     input: UserInput,
-) -> Result<(), String> {
+) -> Result<ThreadSummary, String> {
     engine.send_message(&thread_id, input).await.map_err(show)
 }
 
