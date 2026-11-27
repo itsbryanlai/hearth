@@ -8,3 +8,5 @@
 ^ipc:
 # Tauri dev server on this machine.
 ^http://localhost:1420($|/)
+# Header comment ts-rs writes into every generated file in packages/protocol (a docs link in a comment, never fetched).
+^https://github\.com/Aleph-Alpha/ts-rs$
