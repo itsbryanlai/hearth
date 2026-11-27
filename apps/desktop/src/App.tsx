@@ -1,23 +1,21 @@
-import { invoke } from "@tauri-apps/api/core";
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
+import { StoreContext } from "./state/context";
+import type { AppStore } from "./state/store";
+import { Sidebar } from "./ui/Sidebar";
+import { ThreadView } from "./ui/ThreadView";
 
-export function App() {
-  const [version, setVersion] = useState<string | null>(null);
-
+export function App({ store }: { store: AppStore }) {
   useEffect(() => {
-    let live = true;
-    invoke<string>("app_version").then((v) => {
-      if (live) setVersion(v);
-    });
-    return () => {
-      live = false;
-    };
-  }, []);
+    void store.getState().init();
+    return () => store.getState().dispose();
+  }, [store]);
 
   return (
-    <main>
-      <h1>Hearth</h1>
-      <p>{version === null ? "" : `v${version}`}</p>
-    </main>
+    <StoreContext.Provider value={store}>
+      <div className="app">
+        <Sidebar />
+        <ThreadView />
+      </div>
+    </StoreContext.Provider>
   );
 }
