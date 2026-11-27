@@ -70,6 +70,12 @@ impl From<io::Error> for FsError {
     }
 }
 
+#[cfg(unix)]
+pub enum SnapshotEntry {
+    File(std::fs::File, bool),
+    Symlink(Vec<u8>),
+}
+
 pub struct FsGuard {
     roots: Vec<PathBuf>,
     /// Both the canonical and the literal home, so a denylist entry that does
@@ -154,11 +160,19 @@ impl FsGuard {
     /// Resolve Git's metadata and common directory before Git can inspect them.
     /// Both must be inside the owning project's existing allowlist.
     pub fn git_metadata(&self, cwd: &Path, owner: &FsGuard) -> Result<bool, String> {
+        Ok(self.git_metadata_dirs(cwd, owner)?.is_some())
+    }
+
+    pub fn git_metadata_dirs(
+        &self,
+        cwd: &Path,
+        owner: &FsGuard,
+    ) -> Result<Option<(PathBuf, PathBuf)>, String> {
         let cwd = self.try_check(cwd).map_err(|e| e.to_string())?;
         let dotgit = cwd.as_path().join(".git");
         let meta = match std::fs::symlink_metadata(&dotgit) {
             Ok(meta) => meta,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e.to_string()),
         };
         if meta.file_type().is_symlink() {
@@ -181,20 +195,22 @@ impl FsGuard {
         };
         let gitdir = owner.try_check(&gitdir).map_err(|_| protected())?;
         let common_file = gitdir.as_path().join("commondir");
-        match std::fs::symlink_metadata(&common_file) {
+        let common = match std::fs::symlink_metadata(&common_file) {
             Ok(meta) if meta.is_file() => {
                 let common = owner
                     .read_to_string(&common_file)
                     .map_err(|_| protected())?;
                 owner
                     .try_check(&gitdir.as_path().join(common.trim()))
-                    .map_err(|_| protected())?;
+                    .map_err(|_| protected())?
+                    .as_path()
+                    .to_path_buf()
             }
             Ok(_) => return Err("Invalid Git common directory metadata".into()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => gitdir.as_path().to_path_buf(),
             Err(e) => return Err(e.to_string()),
-        }
-        Ok(true)
+        };
+        Ok(Some((gitdir.as_path().to_path_buf(), common)))
     }
 
     /// The verdict without the debug panic. Prefer [`FsGuard::check`].
@@ -222,16 +238,15 @@ impl FsGuard {
         verdict
     }
 
-    /// Read an ordinary file beneath an allowed directory without following symlinks.
-    /// Each component is opened relative to an already-open directory, so a
-    /// replacement between validation and the read cannot redirect the open.
+    /// Read a file or final symlink beneath an allowed directory without following links.
+    /// Each parent is opened relative to an already-open directory.
     #[cfg(unix)]
-    pub fn read_file_no_symlinks(
+    pub fn read_snapshot_entry(
         &self,
         root: &Path,
         relative: &Path,
-    ) -> Result<(std::fs::File, bool), FsError> {
-        use rustix::fs::{Mode, OFlags, open, openat};
+    ) -> Result<SnapshotEntry, FsError> {
+        use rustix::fs::{Mode, OFlags, open, openat, readlinkat};
         use std::os::unix::fs::PermissionsExt;
         use std::path::Component;
 
@@ -279,7 +294,15 @@ impl FsGuard {
             if parts.peek().is_some() {
                 flags |= OFlags::DIRECTORY;
             }
-            dir = openat(&dir, part, flags, Mode::empty()).map_err(io::Error::from)?;
+            match openat(&dir, part, flags, Mode::empty()) {
+                Ok(next) => dir = next,
+                Err(error) if parts.peek().is_none() => {
+                    return readlinkat(&dir, part, Vec::new())
+                        .map(|link| SnapshotEntry::Symlink(link.into_bytes()))
+                        .map_err(|_| FsError::Io(io::Error::from(error)));
+                }
+                Err(error) => return Err(io::Error::from(error).into()),
+            }
         }
         let file = std::fs::File::from(dir);
         let meta = file.metadata()?;
@@ -289,7 +312,10 @@ impl FsGuard {
                 "not an ordinary file",
             )));
         }
-        Ok((file, meta.permissions().mode() & 0o111 != 0))
+        Ok(SnapshotEntry::File(
+            file,
+            meta.permissions().mode() & 0o111 != 0,
+        ))
     }
 
     pub fn read_to_string(&self, path: &Path) -> Result<String, FsError> {
@@ -308,6 +334,15 @@ impl FsGuard {
         }
         out.sort();
         Ok(out)
+    }
+
+    /// Whether a checkout traversal can encounter a protected home descendant.
+    pub fn allows_snapshot_traversal(&self, root: &Path) -> bool {
+        !self.homes.iter().any(|home| {
+            home.starts_with(root)
+                || home.join(".config/gh").starts_with(root)
+                || home.join("Library/Keychains").starts_with(root)
+        })
     }
 
     fn in_denylist(&self, path: &Path) -> bool {

@@ -1,12 +1,11 @@
 //! Private Git trees built exclusively from guarded bytes.
 use crate::fsguard::FsGuard;
+#[cfg(unix)]
+use crate::fsguard::SnapshotEntry;
 use std::ffi::OsString;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
-
-static WRITER: Mutex<()> = Mutex::new(());
 
 struct PrivateGit {
     _temp: tempfile::TempDir,
@@ -109,14 +108,20 @@ pub fn capture(
     paths: &[PathBuf],
 ) -> Result<String, String> {
     use std::os::unix::ffi::OsStrExt;
-    let _writer = WRITER.lock().map_err(|e| e.to_string())?;
     checked_dir(guard, root)?;
     let git = PrivateGit::open(guard, data, true)?;
     let mut entries = Vec::new();
     for path in paths {
-        let (mut file, executable) = guard
-            .read_file_no_symlinks(root, path)
+        let entry = guard
+            .read_snapshot_entry(root, path)
             .map_err(|e| e.to_string())?;
+        let (mode, mut input): (&[u8], Box<dyn Read>) = match entry {
+            SnapshotEntry::File(file, executable) => (
+                if executable { b"100755 " } else { b"100644 " },
+                Box::new(file),
+            ),
+            SnapshotEntry::Symlink(target) => (b"120000 ", Box::new(io::Cursor::new(target))),
+        };
         let oid = git.git(
             &[
                 "hash-object".into(),
@@ -124,9 +129,9 @@ pub fn capture(
                 "--stdin".into(),
                 "--no-filters".into(),
             ],
-            &mut file,
+            &mut input,
         )?;
-        entries.extend_from_slice(if executable { b"100755 " } else { b"100644 " });
+        entries.extend_from_slice(mode);
         entries.extend_from_slice(oid.trim_ascii_end());
         entries.push(b'\t');
         entries.extend_from_slice(path.as_os_str().as_bytes());
@@ -163,7 +168,6 @@ pub fn diff(guard: &FsGuard, data: &Path, before: &str, after: &str) -> Result<V
     {
         return Err("invalid tree ID".into());
     }
-    let _writer = WRITER.lock().map_err(|e| e.to_string())?;
     let git = PrivateGit::open(guard, data, false)?;
     git.git(
         &[
@@ -176,4 +180,74 @@ pub fn diff(guard: &FsGuard, data: &Path, before: &str, after: &str) -> Result<V
         ],
         &mut &[][..],
     )
+}
+
+/// Selects checkout paths using a private copy of its ordinary index.
+#[cfg(unix)]
+pub fn select(
+    guard: &FsGuard,
+    data: &Path,
+    root: &Path,
+    gitdir: &Path,
+    common: &Path,
+) -> Result<Vec<PathBuf>, String> {
+    use std::collections::BTreeSet;
+    use std::os::unix::ffi::OsStringExt;
+
+    checked_dir(guard, root)?;
+    if !guard.allows_snapshot_traversal(root) {
+        return Err("snapshot checkout contains protected paths".into());
+    }
+    checked_dir(guard, gitdir)?;
+    let git = PrivateGit::open(guard, data, true)?;
+    match guard.read_snapshot_entry(gitdir, Path::new("index")) {
+        Ok(SnapshotEntry::File(mut source, _)) => {
+            let mut target = std::fs::File::create(&git.index).map_err(|e| e.to_string())?;
+            io::copy(&mut source, &mut target).map_err(|e| e.to_string())?;
+        }
+        Err(crate::fsguard::FsError::Io(e)) if e.kind() == io::ErrorKind::NotFound => {}
+        _ => return Err("invalid Git index".into()),
+    }
+    let exclude = git._temp.path().join("exclude");
+    let has_exclude = match guard.read_snapshot_entry(common, Path::new("info/exclude")) {
+        Ok(SnapshotEntry::File(mut source, _)) => {
+            let mut target = std::fs::File::create(&exclude).map_err(|e| e.to_string())?;
+            io::copy(&mut source, &mut target).map_err(|e| e.to_string())?;
+            true
+        }
+        Err(crate::fsguard::FsError::Io(e)) if e.kind() == io::ErrorKind::NotFound => false,
+        _ => return Err("invalid Git exclude file".into()),
+    };
+    let list = |options: &[&str], include_exclude: bool| -> Result<BTreeSet<Vec<u8>>, String> {
+        let mut args = vec![
+            "-C".into(),
+            root.as_os_str().to_owned(),
+            "--work-tree".into(),
+            root.as_os_str().to_owned(),
+            "ls-files".into(),
+            "-z".into(),
+        ];
+        args.extend(options.iter().map(OsString::from));
+        if include_exclude && has_exclude {
+            args.push("--exclude-from".into());
+            args.push(exclude.as_os_str().to_owned());
+        }
+        Ok(git
+            .git(&args, &mut &[][..])?
+            .split(|b| *b == 0)
+            .filter(|p| !p.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect())
+    };
+    let mut paths = list(
+        &["--cached", "--others", "--exclude-per-directory=.gitignore"],
+        true,
+    )?;
+    for deleted in list(&["--deleted"], false)? {
+        paths.remove(&deleted);
+    }
+    Ok(paths
+        .into_iter()
+        .map(|p| PathBuf::from(OsString::from_vec(p)))
+        .collect())
 }

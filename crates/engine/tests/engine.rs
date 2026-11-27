@@ -1096,3 +1096,112 @@ async fn external_git_metadata_refuses_worktrees_but_allows_direct_threads() {
         .await
         .unwrap();
 }
+
+// Fails if turn diffs lose edits, deletions, links or history across reopen.
+#[tokio::test]
+async fn snapshots_changed_checkout_and_reopens_the_diff() {
+    use std::os::unix::fs::symlink;
+    let w = world();
+    let git = |args: &[&str]| {
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&w.project)
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    };
+    git(&["init", "-q"]);
+    std::fs::write(w.project.join("file"), "before\n").unwrap();
+    std::fs::write(w.project.join("deleted"), "gone\n").unwrap();
+    std::fs::write(w.project.join(".gitignore"), "ignored\n").unwrap();
+    std::fs::write(w.project.join("ignored"), "secret\n").unwrap();
+    std::fs::write(w.project.join(".git/info/exclude"), "local-ignore\n").unwrap();
+    std::fs::write(w.project.join("local-ignore"), "secret\n").unwrap();
+    symlink("old-target", w.project.join("link")).unwrap();
+    git(&["add", "file", "deleted", ".gitignore", "link"]);
+    let index = std::fs::read(w.project.join(".git/index")).unwrap();
+    let (app, mut rx) = engine(&w, fixture("acp-approval-allowed.jsonl"));
+    let thread = thread_of(&app, &w).await;
+    app.send_message(&thread, say("go")).await.unwrap();
+    let approval = until(&mut rx, is_approval).await;
+    std::fs::write(w.project.join("file"), "after\n").unwrap();
+    std::fs::remove_file(w.project.join("deleted")).unwrap();
+    std::fs::remove_file(w.project.join("link")).unwrap();
+    symlink("new-target", w.project.join("link")).unwrap();
+    std::fs::write(w.project.join("ignored"), "changed\n").unwrap();
+    std::fs::write(w.project.join("local-ignore"), "changed\n").unwrap();
+    let AgentEvent::ApprovalRequest { request } = &approval.last().unwrap().event else {
+        unreachable!()
+    };
+    app.answer_approval(&thread, &request.id, ApprovalDecision::AllowOnce)
+        .await
+        .unwrap();
+    let events = until(&mut rx, is_end).await;
+    let turn = events.last().unwrap().turn_id.clone();
+    let diff = app.turn_diff(&thread, &turn).await.unwrap().unwrap();
+    let text = String::from_utf8(diff.clone()).unwrap();
+    assert!(
+        text.contains("-before")
+            && text.contains("+after")
+            && text.contains("-gone")
+            && text.contains("+new-target")
+    );
+    assert!(!text.contains("ignored") && !text.contains("local-ignore"));
+    assert_eq!(std::fs::read(w.project.join(".git/index")).unwrap(), index);
+    drop(app);
+    let (reopened, _) = engine(&w, fixture("acp-approval-allowed.jsonl"));
+    assert_eq!(
+        reopened.turn_diff(&thread, &turn).await.unwrap(),
+        Some(diff)
+    );
+}
+
+// Fails if an empty diff is confused with unavailable capture, or reply is lost.
+#[tokio::test]
+async fn snapshots_distinguish_empty_from_unavailable_without_losing_reply() {
+    for scenario in ["empty", "non-git", "unsafe-index", "protected-root"] {
+        let mut w = world();
+        if scenario == "protected-root" {
+            w.home = w.project.clone();
+        }
+        if scenario != "non-git" {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&w.project)
+                    .args(["init", "-q"])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        if scenario == "unsafe-index" {
+            std::os::unix::fs::symlink("missing", w.project.join(".git/index")).unwrap();
+        }
+        let (engine, mut rx) = engine(&w, fixture("acp-approval-allowed.jsonl"));
+        let thread = thread_of(&engine, &w).await;
+        engine.send_message(&thread, say("go")).await.unwrap();
+        let approval = until(&mut rx, is_approval).await;
+        let AgentEvent::ApprovalRequest { request } = &approval.last().unwrap().event else {
+            unreachable!()
+        };
+        engine
+            .answer_approval(&thread, &request.id, ApprovalDecision::AllowOnce)
+            .await
+            .unwrap();
+        let events = until(&mut rx, is_end).await;
+        let turn = &events.last().unwrap().turn_id;
+        assert_eq!(
+            engine.turn_diff(&thread, turn).await.unwrap(),
+            (scenario == "empty").then(Vec::new)
+        );
+        assert!(
+            !engine.load_thread(&thread).unwrap().turns[0]
+                .events
+                .is_empty()
+        );
+    }
+}

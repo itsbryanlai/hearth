@@ -45,6 +45,7 @@ struct Inner {
     store: Mutex<Store>,
     guard: Mutex<FsGuard>,
     home: PathBuf,
+    snapshot_parent: Option<PathBuf>,
     sink: Arc<dyn EventSink>,
     agents: Vec<Registration>,
     sessions: tokio::sync::Mutex<HashMap<ThreadId, Arc<Live>>>,
@@ -145,6 +146,11 @@ impl Engine {
             )?;
             store.update_thread_status(&thread, ThreadStatus::Idle)?;
         }
+        let snapshot_parent = config
+            .db_path
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(Path::to_path_buf);
         let mut roots = config.roots;
         for project in store.list_projects()? {
             let project_path = PathBuf::from(&project.path);
@@ -164,6 +170,7 @@ impl Engine {
                 store: Mutex::new(store),
                 guard: Mutex::new(FsGuard::new(roots, config.home.clone())),
                 home: config.home,
+                snapshot_parent,
                 sink,
                 agents: config.agents,
                 sessions: Default::default(),
@@ -383,6 +390,31 @@ impl Engine {
         }
     }
 
+    /// Returns the retained diff for an assistant turn, or None if unavailable.
+    pub async fn turn_diff(
+        &self,
+        thread: &ThreadId,
+        turn: &TurnId,
+    ) -> Result<Option<Vec<u8>>, EngineError> {
+        let (before, after) = lock(&self.inner.store)
+            .turn_tree_pair(thread, turn)?
+            .ok_or("unknown assistant turn")?;
+        let (Some(before), Some(after), Some(parent)) =
+            (before, after, self.inner.snapshot_parent.clone())
+        else {
+            return Ok(None);
+        };
+        let home = self.inner.home.clone();
+        Ok(tokio::task::spawn_blocking(move || {
+            let guard = FsGuard::new([parent.clone()], home);
+            let data = guard.try_check(&parent).ok()?.as_path().join("snapshots");
+            hearth_core::snapshot::diff(&guard, &data, &before, &after).ok()
+        })
+        .await
+        .ok()
+        .flatten())
+    }
+
     /// The thread as stored; the agent's own replay is not used for display.
     pub fn load_thread(&self, id: &ThreadId) -> Result<ThreadSnapshot, EngineError> {
         let store = lock(&self.inner.store);
@@ -559,6 +591,7 @@ impl Engine {
         {
             self.apply_model(thread_id, &live, selected).await?;
         }
+        let before = capture_turn_tree(self.inner.clone(), thread.clone()).await;
         let (turn, summary) = {
             let state = lock(&live.model);
             let mut store = lock(&self.inner.store);
@@ -568,7 +601,8 @@ impl Engine {
                 }
                 None => session.id,
             };
-            let user = store.start_turn(thread_id, &session_id, TurnRole::User, None)?;
+            let user =
+                store.start_turn(thread_id, &session_id, TurnRole::User, before.as_deref())?;
             store.set_turn_input(&user.id, &input)?;
             let turn = store.start_turn(thread_id, &session_id, TurnRole::Assistant, None)?;
             if thread.title == NEW_THREAD_TITLE {
@@ -959,6 +993,50 @@ async fn run_turn(
     }
 }
 
+async fn capture_turn_tree(inner: Arc<Inner>, thread: store::Thread) -> Option<String> {
+    let parent = inner.snapshot_parent.clone()?;
+    let checked_root = lock(&inner.guard)
+        .try_check(Path::new(&thread.cwd))
+        .ok()?
+        .as_path()
+        .to_path_buf();
+    if checked_root != Path::new(&thread.cwd) {
+        return None;
+    }
+    let project = lock(&inner.store)
+        .list_projects()
+        .ok()?
+        .into_iter()
+        .find(|p| p.id == thread.project_id)?;
+    let home = inner.home.clone();
+    tokio::task::spawn_blocking(move || {
+        let project = PathBuf::from(project.path);
+        let root = PathBuf::from(&thread.cwd);
+        if root != project && thread.worktree_path.as_deref() != Some(thread.cwd.as_str()) {
+            return None;
+        }
+        let owner = FsGuard::new([project.clone()], home.clone());
+        let guard = FsGuard::new([project.clone(), root.clone(), parent.clone()], home);
+        let (_, common) = owner.git_metadata_dirs(&project, &owner).ok()??;
+        let (gitdir, checkout_common) = guard.git_metadata_dirs(&root, &owner).ok()??;
+        if common != checkout_common {
+            return None;
+        }
+        let parent = guard.try_check(&parent).ok()?;
+        let data = parent.as_path().join("snapshots");
+        match std::fs::create_dir(&data) {
+            Ok(()) => (),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
+            Err(_) => return None,
+        }
+        let paths = hearth_core::snapshot::select(&guard, &data, &root, &gitdir, &common).ok()?;
+        hearth_core::snapshot::capture(&guard, &data, &root, &paths).ok()
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 fn cancelled() -> AgentItem {
     AgentItem {
         event: AgentEvent::TurnEnd {
@@ -1054,6 +1132,24 @@ async fn flush(
         .iter()
         .any(|e| matches!(e.event, AgentEvent::Error { .. }));
     let ended = events.iter().any(is_turn_end);
+    if ended {
+        if let Some(end_index) = events.iter().position(is_turn_end) {
+            let earlier = events.drain(..end_index).collect();
+            let mut payloads = persist(inner, thread, turn, earlier);
+            if let Some(first) = payloads.first_mut() {
+                first.model = state.model.take();
+            }
+            for payload in payloads {
+                inner.sink.emit(payload);
+            }
+        }
+        let stored = lock(&inner.store).get_thread(thread).ok();
+        if let Some(stored) = stored
+            && let Some(tree) = capture_turn_tree(inner.clone(), stored).await
+        {
+            let _ = lock(&inner.store).set_turn_tree_snapshot(turn, &tree);
+        }
+    }
     let mut payloads = persist(inner, thread, turn, events);
     if let Some(first) = payloads.first_mut() {
         first.model = state.model.take();

@@ -44,17 +44,25 @@ fn fails_if_private_snapshots_change_the_source_index_or_lose_a_diff() {
     let objects = git_output(&["count-objects", "-v"]);
     let refs = git_output(&["for-each-ref"]);
     let guard = FsGuard::new([project.clone(), data.clone()], temp.path().to_path_buf());
-    let before = snapshot::capture(&guard, &data, &project, std::slice::from_ref(&path)).unwrap();
+    symlink("old-target", project.join("link")).unwrap();
+    let paths = [path.clone(), PathBuf::from("link")];
+    let before = snapshot::capture(&guard, &data, &project, &paths).unwrap();
     fs::write(project.join(&path), b"after\n").unwrap();
-    let after = snapshot::capture(&guard, &data, &project, std::slice::from_ref(&path)).unwrap();
+    fs::remove_file(project.join("link")).unwrap();
+    symlink("new-target", project.join("link")).unwrap();
+    let after = snapshot::capture(&guard, &data, &project, &paths).unwrap();
     let diff = snapshot::diff(&guard, &data, &before, &after).unwrap();
     assert!(diff.windows(b"-before\n".len()).any(|s| s == b"-before\n"));
     assert!(diff.windows(b"+after\n".len()).any(|s| s == b"+after\n"));
+    assert!(
+        diff.windows(b"+new-target".len())
+            .any(|s| s == b"+new-target")
+    );
     assert_eq!(fs::read(project.join(".git/index")).unwrap(), index);
     assert_eq!(git_output(&["count-objects", "-v"]), objects);
     assert_eq!(git_output(&["for-each-ref"]), refs);
-    symlink(project.join(&path), project.join("link")).unwrap();
-    assert!(snapshot::capture(&guard, &data, &project, &["link".into()]).is_err());
+    symlink(&project, project.join("parent-link")).unwrap();
+    assert!(snapshot::capture(&guard, &data, &project, &["parent-link/file".into()]).is_err());
 }
 
 #[test]
@@ -118,4 +126,42 @@ fn fails_if_git_omits_a_requested_reserved_path() {
     let guard = FsGuard::new([project.clone(), data.clone()], base);
     assert!(snapshot::capture(&guard, &data, &project, &[".git/file".into()]).is_err());
     assert!(snapshot::capture(&guard, &data, &project, &["file".into()]).is_ok());
+}
+
+// Fails if independent captures cannot share the app-owned object store.
+#[test]
+fn concurrent_captures_preserve_both_trees() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let project = base.join("project");
+    let data = base.join("data");
+    fs::create_dir(&project).unwrap();
+    fs::create_dir(&data).unwrap();
+    fs::write(project.join("first"), "first contents\n").unwrap();
+    fs::write(project.join("second"), "second contents\n").unwrap();
+    let guard = FsGuard::new([project.clone(), data.clone()], base);
+    let barrier = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        let capture = |name: &'static str| {
+            let guard = &guard;
+            let data = &data;
+            let project = &project;
+            let barrier = &barrier;
+            scope.spawn(move || {
+                barrier.wait();
+                snapshot::capture(guard, data, project, &[name.into()]).unwrap()
+            })
+        };
+        let first = capture("first");
+        let second = capture("second");
+        let diff = snapshot::diff(
+            &guard,
+            &data,
+            &first.join().unwrap(),
+            &second.join().unwrap(),
+        )
+        .unwrap();
+        let diff = String::from_utf8(diff).unwrap();
+        assert!(diff.contains("-first contents") && diff.contains("+second contents"));
+    });
 }
