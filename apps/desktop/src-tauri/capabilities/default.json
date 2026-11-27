@@ -1,0 +1,10 @@
+{
+  "identifier": "default",
+  "description": "Hearth's own IPC only: no plugins, no http, shell or fs.",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "allow-app-version"
+  ]
+}

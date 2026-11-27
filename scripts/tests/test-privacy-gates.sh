@@ -42,6 +42,8 @@ s_rust_ok() {
   mkcrate crates/core core 'serde_lite = { path = "../../vendor/serde_lite" }'
 }
 s_host_bad() { mkdir -p apps/ui; echo 'const u = "https://example.com/x";' > apps/ui/a.ts; }
+s_host_csp() { mkdir -p apps/ui; echo '"csp": "connect-src ipc: http://ipc.localhost; img-src data:"' > apps/ui/a.json; }
+s_host_semicolon_bad() { mkdir -p apps/ui; echo '"csp": "connect-src https://evil.example; img-src data:"' > apps/ui/a.json; }
 s_host_allowed() { mkdir -p apps/ui; echo "csp: connect-src ipc: http://ipc.localhost" > apps/ui/a.ts; }
 s_host_md() { mkdir -p apps/ui; echo 'See https://example.com/docs' > apps/ui/README.md; }
 
@@ -54,6 +56,8 @@ run_case "Rust crate depending on local crate reqwest fails"   s_rust_banned    
 run_case "Rust crate with only allowed deps passes"            s_rust_ok        0 "privacy gates: ok"
 run_case "hard-coded https://example.com in apps/ fails"       s_host_bad       1 "hard-coded host 'https://example.com/x'"
 run_case "allowlisted http://ipc.localhost passes"             s_host_allowed   0 "privacy gates: ok"
+run_case "allowlisted host followed by ; in a CSP passes"      s_host_csp       0 "privacy gates: ok"
+run_case "remote host followed by ; in a CSP fails"           s_host_semicolon_bad 1 "hard-coded host 'https://evil.example'"
 run_case "URL inside a .md file passes"                        s_host_md        0 "privacy gates: ok"
 
 echo "total: $pass passed, $failn failed"
