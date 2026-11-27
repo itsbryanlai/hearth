@@ -384,6 +384,25 @@ impl Store {
         Ok(turn)
     }
 
+    pub fn turn_tree_pair(
+        &self,
+        thread: &ThreadId,
+        turn: &TurnId,
+    ) -> Result<Option<(Option<String>, Option<String>)>> {
+        Ok(self.conn.query_row(
+            "SELECT (SELECT tree_snapshot FROM turns previous WHERE previous.thread_id = current.thread_id AND previous.seq = current.seq - 1 AND previous.role = 'user'), current.tree_snapshot FROM turns current WHERE current.thread_id = ?1 AND current.id = ?2 AND current.role = 'assistant'",
+            params![thread.0, turn.0], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?)
+    }
+
+    pub fn set_turn_tree_snapshot(&mut self, turn: &TurnId, tree: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE turns SET tree_snapshot = ?1 WHERE id = ?2",
+            params![tree, turn.0],
+        )?;
+        Ok(())
+    }
+
     /// Appends a batch in one transaction; `seq` continues from the turn's last event.
     pub fn append_events(&mut self, turn: &TurnId, events: &[NewEvent]) -> Result<()> {
         let tx = self.conn.transaction()?;
