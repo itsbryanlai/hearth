@@ -162,6 +162,9 @@ export function createMockIpc(options: Options = {}): Ipc {
         lastSeq: seqs.get(threadId) ?? 0,
       };
     },
+    reviewTurns: async (threadId) => (turns.get(threadId) ?? []).map((t) => ({ turnId: t.turnId, label: t.input.kind === "text" ? t.input.text : "Turn", available: false })),
+    turnDiffFiles: async () => null,
+    turnDiffFile: async () => null,
     async listThreadModels(threadId) {
       const thread = threads.find((t) => t.id === threadId);
       if (!thread) throw new Error(`unknown thread ${threadId}`);

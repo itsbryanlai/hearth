@@ -1,3 +1,5 @@
+import { useState } from "react";
+import { Changes } from "./Changes";
 import type { ThreadSummary } from "../ipc/contract";
 import { useApp } from "../state/context";
 import { Composer } from "./Composer";
@@ -46,6 +48,7 @@ function ModelPicker({ thread, running }: { thread: ThreadSummary; running: bool
 }
 
 export function ThreadView() {
+  const [changesOpen, setChangesOpen] = useState(false);
   const threadId = useApp((s) => s.activeThreadId);
   const thread = useApp((s) =>
     Object.values(s.threads)
@@ -68,6 +71,7 @@ export function ThreadView() {
           </span>
         ) : null}
         {thread ? <ModelPicker thread={thread} running={running} /> : null}
+        {thread ? <button onClick={() => setChangesOpen((open) => !open)}>Changes</button> : null}
         {thread ? <span className="muted">{running ? "running" : "idle"}</span> : null}
       </header>
       {error ? (
@@ -75,7 +79,10 @@ export function ThreadView() {
           {error}
         </div>
       ) : null}
-      {threadId ? <TranscriptView key={threadId} threadId={threadId} remembersApprovals={remembersApprovals} /> : <div className="transcript empty" />}
+      <div className="thread-content">
+        {threadId ? <TranscriptView key={threadId} threadId={threadId} remembersApprovals={remembersApprovals} /> : <div className="transcript empty" />}
+        {threadId && changesOpen ? <Changes key={threadId} threadId={threadId} onClose={() => setChangesOpen(false)} /> : null}
+      </div>
       <Composer />
     </main>
   );

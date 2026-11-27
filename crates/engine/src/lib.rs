@@ -8,7 +8,9 @@ mod coalesce;
 mod engine;
 
 pub use api::{
-    AgentStatus, EngineError, EventSink, InstalledAgent, Project, ThreadEventPayload, ThreadModels,
-    ThreadSnapshot, ThreadSummary, TurnSnapshot, WorktreeInfo,
+    AgentStatus, EngineError, EventSink, InstalledAgent, Project, ReviewTurn, ThreadEventPayload,
+    ThreadModels, ThreadSnapshot, ThreadSummary, TurnSnapshot, WorktreeInfo,
 };
 pub use engine::{Engine, EngineConfig};
+
+pub use hearth_core::snapshot::{DiffFile, DiffHunk, DiffRow, DiffRowKind, FileDiff, SplitRow};

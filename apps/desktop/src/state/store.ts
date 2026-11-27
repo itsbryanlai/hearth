@@ -35,6 +35,9 @@ export type AppState = {
   modelPickers: Record<string, ModelPickerState>;
   activeThreadId: string | null;
   error: string | null;
+  reviewTurns: Ipc["reviewTurns"];
+  turnDiffFiles: Ipc["turnDiffFiles"];
+  turnDiffFile: Ipc["turnDiffFile"];
   init(): Promise<void>;
   addProject(path: string): Promise<void>;
   worktreeInfo(projectId: string): Promise<{ isGit: boolean; base: string | null; reason: string | null }>;
@@ -185,6 +188,9 @@ export function createAppStore(ipc: Ipc, options: Options = {}): AppStore {
           fail(e);
         }
       },
+      reviewTurns: (threadId) => ipc.reviewTurns(threadId),
+      turnDiffFiles: (threadId, turnId) => ipc.turnDiffFiles(threadId, turnId),
+      turnDiffFile: (threadId, turnId, fileId) => ipc.turnDiffFile(threadId, turnId, fileId),
       worktreeInfo: (projectId) => ipc.worktreeInfo(projectId),
       async createThread(projectId, agent, base, parent) {
         try {

@@ -2,10 +2,12 @@ use hearth_engine::agents::Registration;
 use hearth_engine::agents::claude::ClaudeAdapter;
 use hearth_engine::agents::qwen::{QwenAdapter, QwenLauncher};
 use hearth_engine::{
-    Engine, EngineConfig, EventSink, InstalledAgent, Project, ThreadEventPayload, ThreadModels,
-    ThreadSnapshot, ThreadSummary,
+    DiffFile, Engine, EngineConfig, EventSink, FileDiff, InstalledAgent, Project, ReviewTurn,
+    ThreadEventPayload, ThreadModels, ThreadSnapshot, ThreadSummary,
 };
-use hearth_protocol::{AgentId, ApprovalDecision, ApprovalId, ProjectId, ThreadId, UserInput};
+use hearth_protocol::{
+    AgentId, ApprovalDecision, ApprovalId, ProjectId, ThreadId, TurnId, UserInput,
+};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::{Emitter, Manager, State};
@@ -77,6 +79,36 @@ async fn create_thread(
 #[tauri::command]
 fn load_thread(engine: State<'_, Engine>, thread_id: ThreadId) -> Result<ThreadSnapshot, String> {
     engine.load_thread(&thread_id).map_err(show)
+}
+
+#[tauri::command]
+fn review_turns(engine: State<'_, Engine>, thread_id: ThreadId) -> Result<Vec<ReviewTurn>, String> {
+    engine.review_turns(&thread_id).map_err(show)
+}
+
+#[tauri::command]
+async fn turn_diff_files(
+    engine: State<'_, Engine>,
+    thread_id: ThreadId,
+    turn_id: TurnId,
+) -> Result<Option<Vec<DiffFile>>, String> {
+    engine
+        .turn_diff_files(&thread_id, &turn_id)
+        .await
+        .map_err(show)
+}
+
+#[tauri::command]
+async fn turn_diff_file(
+    engine: State<'_, Engine>,
+    thread_id: ThreadId,
+    turn_id: TurnId,
+    file_id: String,
+) -> Result<Option<FileDiff>, String> {
+    engine
+        .turn_diff_file(&thread_id, &turn_id, &file_id)
+        .await
+        .map_err(show)
 }
 
 #[tauri::command]
@@ -213,6 +245,9 @@ fn main() {
             worktree_info,
             create_thread,
             load_thread,
+            review_turns,
+            turn_diff_files,
+            turn_diff_file,
             list_thread_models,
             set_thread_model,
             send_message,
