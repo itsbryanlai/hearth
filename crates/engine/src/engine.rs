@@ -1,13 +1,12 @@
 //! The engine: store, guard and live agent sessions behind the UI's operations.
 
-use crate::agents::AgentLauncher;
 use crate::agents::qwen::{DEFAULT_PASSTHROUGH, PASSTHROUGH_SETTING};
+use crate::agents::{AgentAdapter, AgentItem, AgentSession, AgentStream};
 use crate::api::{
     EngineError, EventSink, Project, ThreadEventPayload, ThreadSnapshot, ThreadSummary,
     TurnSnapshot,
 };
 use crate::coalesce::coalesce;
-use hearth_adapter_qwen::{AdapterItem, AdapterStream, QwenProcess};
 use hearth_core::fsguard::FsGuard;
 use hearth_core::store::{self, NewEvent, NewThread, Store, ThreadStatus, TurnRole};
 use hearth_protocol::{
@@ -17,7 +16,7 @@ use hearth_protocol::{
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use tokio::time::Instant;
@@ -33,7 +32,7 @@ pub struct EngineConfig {
     pub home: PathBuf,
     /// Allowed roots besides the projects (the app's data dir).
     pub roots: Vec<PathBuf>,
-    pub launcher: Arc<dyn AgentLauncher>,
+    pub launcher: Arc<dyn AgentAdapter>,
 }
 
 #[derive(Clone)]
@@ -46,7 +45,7 @@ struct Inner {
     guard: Mutex<FsGuard>,
     home: PathBuf,
     sink: Arc<dyn EventSink>,
-    launcher: Arc<dyn AgentLauncher>,
+    launcher: Arc<dyn AgentAdapter>,
     sessions: tokio::sync::Mutex<HashMap<ThreadId, Arc<Live>>>,
     running: Mutex<HashSet<ThreadId>>,
     /// Next `seq` to hand out, per thread.
@@ -56,11 +55,8 @@ struct Inner {
 
 /// One live agent process and the approvals it is waiting on.
 struct Live {
-    process: QwenProcess,
+    process: Arc<dyn AgentSession>,
     pending: Mutex<HashMap<ApprovalId, (ApprovalRequest, TurnId)>>,
-    /// False until a turn has run on this session; an auth failure before
-    /// that gets the setup hint.
-    turn_done: AtomicBool,
     /// Counts turns on this session; a cancel names the turn it was for.
     turn_seq: AtomicU64,
     /// Set (with `force_end` notified) when a cancelled turn got no end from
@@ -356,38 +352,18 @@ impl Engine {
             .try_check(&cwd)
             .map_err(|d| EngineError(d.to_string()))?;
         let passthrough = self.passthrough_names()?;
-        let launcher = self.inner.launcher.clone();
-        let spawn_cwd = cwd.clone();
-        let config =
-            tokio::task::spawn_blocking(move || launcher.spawn_config(&spawn_cwd, &passthrough))
-                .await
-                .map_err(|e| EngineError(e.to_string()))??;
-        let process = QwenProcess::spawn(config).map_err(|e| EngineError(e.to_string()))?;
-        let fail =
-            |e: hearth_adapter_qwen::AdapterError| EngineError(with_auth_hint(&e.to_string()));
-        process.initialize().await.map_err(fail)?;
-        let resumed = match &session.external_session_id {
-            Some(id) => process
-                .load_session(id, &cwd)
-                .await
-                .ok()
-                .map(|l| (id.clone(), l.models)),
-            None => None,
-        };
-        let had_session = resumed.is_some();
-        let (external, models) = match resumed {
-            Some(r) => r,
-            None => process.new_session(&cwd).await.map_err(fail)?,
-        };
-        let model = models
-            .current
-            .or_else(|| models.available.first().map(|m| m.id.clone()))
-            .unwrap_or_default();
-        lock(&self.inner.store).update_agent_session(&session.id, &model, &external)?;
+        let opened = self
+            .inner
+            .launcher
+            .open_session(&cwd, session.external_session_id.as_deref(), &passthrough)
+            .await
+            .map_err(EngineError)?;
+        if let (Some(model), Some(external)) = (&opened.model, &opened.external_id) {
+            lock(&self.inner.store).update_agent_session(&session.id, model, external)?;
+        }
         let live = Arc::new(Live {
-            process,
+            process: opened.session,
             pending: Default::default(),
-            turn_done: AtomicBool::new(had_session),
             turn_seq: AtomicU64::new(0),
             force_seq: AtomicU64::new(0),
             force_end: tokio::sync::Notify::new(),
@@ -428,7 +404,7 @@ impl Engine {
             store.update_thread_status(thread, ThreadStatus::Running)?;
         }
         live.process
-            .answer_permission(&request, decision)
+            .answer_approval(&request, decision)
             .await
             .map_err(|e| EngineError(e.to_string()))
     }
@@ -524,30 +500,6 @@ fn rule_matches(store: &Store, thread: &ThreadId, request: &ApprovalRequest) -> 
     }
 }
 
-/// An authentication failure gets the way out appended.
-fn with_auth_hint(message: &str) -> String {
-    let lower = message.to_lowercase();
-    let auth = [
-        "auth",
-        "api key",
-        "api_key",
-        "apikey",
-        "unauthorized",
-        "401",
-        "credential",
-        "log in",
-        "login",
-        "sign in",
-    ];
-    if auth.iter().any(|k| lower.contains(k)) {
-        format!(
-            "{message} Run `qwen` in your terminal to set up the provider key, or add the key's variable name in Settings."
-        )
-    } else {
-        message.to_owned()
-    }
-}
-
 fn is_urgent(event: &AgentEvent) -> bool {
     matches!(
         event,
@@ -563,7 +515,7 @@ struct TurnState {
 }
 
 enum Step {
-    Item(Option<AdapterItem>),
+    Item(Option<AgentItem>),
     Tick,
     /// The agent did not end a cancelled turn in time.
     ForceEnd,
@@ -577,20 +529,20 @@ async fn run_turn(
     thread: ThreadId,
     turn: TurnId,
     seq: u64,
-    mut stream: AdapterStream,
+    mut stream: Box<dyn AgentStream>,
 ) {
-    let mut buf: Vec<AdapterItem> = Vec::new();
+    let mut buf: Vec<AgentItem> = Vec::new();
     let mut deadline: Option<Instant> = None;
     let mut state = TurnState::default();
     loop {
         let step = match deadline {
             Some(d) => tokio::select! {
-                item = stream.next() => Step::Item(item),
+                item = std::future::poll_fn(|cx| stream.poll_next(cx)) => Step::Item(item),
                 () = tokio::time::sleep_until(d) => Step::Tick,
                 () = live.force_end.notified() => Step::ForceEnd,
             },
             None => tokio::select! {
-                item = stream.next() => Step::Item(item),
+                item = std::future::poll_fn(|cx| stream.poll_next(cx)) => Step::Item(item),
                 () = live.force_end.notified() => Step::ForceEnd,
             },
         };
@@ -631,7 +583,7 @@ async fn run_turn(
                     continue;
                 }
                 // What arrived is kept; the late answer of the agent is dropped.
-                buf.push(AdapterItem {
+                buf.push(AgentItem {
                     event: AgentEvent::TurnEnd {
                         stop_reason: StopReason::Cancelled,
                     },
@@ -672,27 +624,21 @@ async fn flush(
     thread: &ThreadId,
     turn: &TurnId,
     state: &mut TurnState,
-    items: Vec<AdapterItem>,
+    items: Vec<AgentItem>,
     last: bool,
 ) {
     let mut events = coalesce(items);
     let mut auto_answered = Vec::new();
     for e in &mut events {
-        match &mut e.event {
-            AgentEvent::ApprovalRequest { request } => {
-                if rule_matches(&lock(&inner.store), thread, request) {
-                    auto_answered.push(request.clone());
-                    request.title = format!("{} (allowed for this thread)", request.title);
-                } else {
-                    lock(&live.pending).insert(request.id.clone(), (request.clone(), turn.clone()));
-                    let _ = lock(&inner.store)
-                        .update_thread_status(thread, ThreadStatus::AwaitingApproval);
-                }
+        if let AgentEvent::ApprovalRequest { request } = &mut e.event {
+            if rule_matches(&lock(&inner.store), thread, request) {
+                auto_answered.push(request.clone());
+                request.title = format!("{} (allowed for this thread)", request.title);
+            } else {
+                lock(&live.pending).insert(request.id.clone(), (request.clone(), turn.clone()));
+                let _ =
+                    lock(&inner.store).update_thread_status(thread, ThreadStatus::AwaitingApproval);
             }
-            AgentEvent::Error { message } if !live.turn_done.load(Ordering::Relaxed) => {
-                *message = with_auth_hint(message);
-            }
-            _ => {}
         }
     }
     if last && !state.ended && !events.iter().any(is_turn_end) {
@@ -723,7 +669,7 @@ async fn flush(
     let payloads = persist(inner, thread, turn, events);
     if ended {
         state.ended = true;
-        live.turn_done.store(true, Ordering::Relaxed);
+        live.process.turn_completed();
         let status = if state.errored {
             ThreadStatus::Error
         } else {
@@ -740,7 +686,7 @@ async fn flush(
         let _ = lock(&inner.store).record_approval(turn, &request, ApprovalDecision::AllowOnce);
         let _ = live
             .process
-            .answer_permission(&request, ApprovalDecision::AllowOnce)
+            .answer_approval(&request, ApprovalDecision::AllowOnce)
             .await;
     }
 }

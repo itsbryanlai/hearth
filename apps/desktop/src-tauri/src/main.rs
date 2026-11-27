@@ -100,7 +100,7 @@ fn start_engine(app: &tauri::App) -> Result<Engine, Box<dyn std::error::Error>> 
             db_path: Some(data_dir.join("hearth.db")),
             home,
             roots: vec![data_dir],
-            launcher,
+            launcher: Arc::new(hearth_engine::agents::qwen::QwenAdapter(launcher)),
         },
         Arc::new(TauriSink(app.handle().clone())),
     )?)

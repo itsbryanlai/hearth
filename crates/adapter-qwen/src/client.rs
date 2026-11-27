@@ -565,7 +565,11 @@ pub struct AdapterStream {
 
 impl AdapterStream {
     pub async fn next(&mut self) -> Option<AdapterItem> {
-        poll_fn(|cx| self.rx.poll_recv(cx)).await
+        poll_fn(|cx| self.poll_next(cx)).await
+    }
+
+    pub fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<AdapterItem>> {
+        self.rx.poll_recv(cx)
     }
 }
 
