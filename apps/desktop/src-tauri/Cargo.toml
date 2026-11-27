@@ -10,3 +10,8 @@ tauri-build = { version = "=2.7.6", features = [] }
 [dependencies]
 hearth-core = { path = "../../../crates/core" }
 tauri = { version = "=2.12.7", default-features = false, features = ["wry", "common-controls-v6", "dynamic-acl", "x11", "compression"] }
+
+[features]
+# Test-only: plants one deliberate outbound connection so the egress test can prove it detects it.
+# Never enabled by default or in a release build. Uses std::net and the webview only.
+egress-selftest = []
