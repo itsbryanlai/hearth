@@ -1320,6 +1320,7 @@ dependencies = [
 name = "hearth-engine"
 version = "0.1.0"
 dependencies = [
+ "hearth-adapter-claude",
  "hearth-adapter-qwen",
  "hearth-core",
  "hearth-protocol",

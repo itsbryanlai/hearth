@@ -29,9 +29,11 @@ function Collapsible({
 
 function ApprovalCard({
   block,
+  remembersApprovals,
   onAnswer,
 }: {
   block: Extract<Block, { kind: "approval" }>;
+  remembersApprovals: boolean;
   onAnswer: (approvalId: string, decision: ApprovalDecision) => void;
 }) {
   const { request, answer } = block;
@@ -48,7 +50,7 @@ function ApprovalCard({
       <pre className="mono">{request.detail}</pre>
       {answer === undefined ? (
         <div className="approval-actions">
-          {choices.map(([label, decision]) => (
+          {choices.filter(([, decision]) => remembersApprovals || decision !== "allowForThread").map(([label, decision]) => (
             <button
               key={decision}
               type="button"
@@ -68,9 +70,11 @@ function ApprovalCard({
 
 export function BlockView({
   block,
+  remembersApprovals,
   onAnswer,
 }: {
   block: Block;
+  remembersApprovals: boolean;
   onAnswer: (approvalId: string, decision: ApprovalDecision) => void;
 }) {
   switch (block.kind) {
@@ -107,7 +111,7 @@ export function BlockView({
         </div>
       );
     case "approval":
-      return <ApprovalCard block={block} onAnswer={onAnswer} />;
+      return <ApprovalCard block={block} remembersApprovals={remembersApprovals} onAnswer={onAnswer} />;
     case "error":
       return (
         <div className="block error" role="alert">

@@ -9,6 +9,18 @@ import type {
   UserInput,
 } from "@hearth/protocol";
 
+export type AgentStatus =
+  | { kind: "ready" }
+  | { kind: "missing" }
+  | { kind: "unsupported"; version: string };
+
+export type InstalledAgent = {
+  id: AgentId;
+  label: string;
+  status: AgentStatus;
+  remembersApprovals: boolean;
+};
+
 export type Project = { id: ProjectId; name: string; path: string };
 
 export type ThreadSummary = {
@@ -40,6 +52,7 @@ export type ThreadEventPayload = {
   threadId: ThreadId;
   turnId: TurnId;
   seq: number;
+  model?: string;
   event: AgentEvent;
 };
 
@@ -50,6 +63,7 @@ export const THREAD_EVENT_CHANNEL = "thread-event";
  * name in snake_case (`listProjects` is `list_projects`).
  */
 export interface Ipc {
+  listAgents(): Promise<InstalledAgent[]>;
   listProjects(): Promise<Project[]>;
   addProject(path: string): Promise<Project>;
   listThreads(projectId: ProjectId): Promise<ThreadSummary[]>;

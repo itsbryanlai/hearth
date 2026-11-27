@@ -3,20 +3,23 @@
 //! allowlist plus the variable names the user chose, with values taken from
 //! the login shell. No value is ever logged, stored or emitted.
 
-use super::{AgentAdapter, AgentFuture, AgentItem, AgentSession, AgentStream, OpenSession};
+use super::{
+    AgentAdapter, AgentFuture, AgentItem, AgentSession, AgentStream, EnvPassthrough, OpenSession,
+    StreamItem, login_shell_output, run_limited,
+};
+use crate::api::AgentStatus;
 use hearth_adapter_qwen::QwenProcess;
 use hearth_adapter_qwen::SpawnConfig;
 use hearth_protocol::{AgentEvent, ApprovalDecision, ApprovalRequest, UserInput};
 use std::collections::BTreeMap;
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::OnceLock;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Variables passed on from Hearth's own environment (only those present).
 pub const ENV_ALLOWLIST: [&str; 9] = [
@@ -75,36 +78,6 @@ fn is_identifier(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// Runs a command with a time limit; stdout on success, `None` otherwise.
-fn run_limited(mut cmd: Command, limit: Duration) -> Option<String> {
-    let mut child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let mut stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
-        let mut out = String::new();
-        let _ = stdout.read_to_string(&mut out);
-        out
-    });
-    let start = Instant::now();
-    let ok = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status.success(),
-            Ok(None) if start.elapsed() < limit => std::thread::sleep(Duration::from_millis(10)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break false;
-            }
-        }
-    };
-    let out = reader.join().ok()?;
-    ok.then_some(out)
-}
-
 /// What the login shell told us, read once.
 struct Detected {
     program: PathBuf,
@@ -132,24 +105,8 @@ impl QwenLauncher {
         }
     }
 
-    /// Reads the login shell's PATH and finds `qwen` now (otherwise on first
-    /// spawn). Blocking; safe to call from a background thread at startup.
-    pub fn prewarm(&self) {
-        let _ = self.detect();
-    }
-
     fn shell_output(&self, script: &str) -> Option<String> {
-        let mut cmd = Command::new(&self.shell);
-        cmd.args(["-lc", script])
-            .env_clear()
-            .env("HOME", &self.home)
-            .env("SHELL", &self.shell);
-        for name in ["USER", "LOGNAME"] {
-            if let Ok(v) = std::env::var(name) {
-                cmd.env(name, v);
-            }
-        }
-        run_limited(cmd, Duration::from_secs(10))
+        login_shell_output(&self.shell, &self.home, script)
     }
 
     /// One variable's value in the login shell. A login shell may print noise
@@ -194,6 +151,12 @@ fn version_works(program: &Path, path: Option<&str>, home: &Path) -> bool {
 }
 
 impl AgentLauncher for QwenLauncher {
+    fn available(&self) -> bool {
+        self.program_override
+            .as_ref()
+            .map_or_else(|| self.detect().is_ok(), |program| program.is_file())
+    }
+
     fn spawn_config(&self, cwd: &Path, passthrough: &[String]) -> Result<SpawnConfig, String> {
         let program = match &self.program_override {
             Some(p) => p.clone(),
@@ -221,6 +184,10 @@ impl AgentLauncher for QwenLauncher {
 
 /// Supplies Qwen's spawn policy on a blocking thread.
 pub trait AgentLauncher: Send + Sync {
+    fn available(&self) -> bool {
+        true
+    }
+
     fn spawn_config(&self, cwd: &Path, passthrough: &[String]) -> Result<SpawnConfig, String>;
 }
 
@@ -228,6 +195,27 @@ pub trait AgentLauncher: Send + Sync {
 pub struct QwenAdapter(pub Arc<dyn AgentLauncher>);
 
 impl AgentAdapter for QwenAdapter {
+    fn availability(&self) -> AgentFuture<'_, AgentStatus> {
+        Box::pin(async move {
+            let launcher = self.0.clone();
+            match tokio::task::spawn_blocking(move || launcher.available()).await {
+                Ok(true) => AgentStatus::Ready,
+                _ => AgentStatus::Missing,
+            }
+        })
+    }
+
+    fn passthrough(&self) -> Option<EnvPassthrough> {
+        Some(EnvPassthrough {
+            key: PASSTHROUGH_SETTING,
+            defaults: &DEFAULT_PASSTHROUGH,
+        })
+    }
+
+    fn remembers_approvals(&self) -> bool {
+        true
+    }
+
     fn open_session<'a>(
         &'a self,
         cwd: &'a Path,
@@ -284,10 +272,13 @@ struct QwenSession {
     turn_done: Arc<AtomicBool>,
 }
 impl AgentSession for QwenSession {
-    fn prompt(&self, input: UserInput) -> Box<dyn AgentStream> {
-        Box::new(QwenStream {
-            source: self.process.prompt(input),
-            done: self.turn_done.clone(),
+    fn prompt(&self, input: UserInput) -> AgentFuture<'_, Result<Box<dyn AgentStream>, String>> {
+        Box::pin(async move {
+            let stream: Box<dyn AgentStream> = Box::new(QwenStream {
+                source: self.process.prompt(input),
+                done: self.turn_done.clone(),
+            });
+            Ok(stream)
         })
     }
     fn turn_completed(&self) {
@@ -315,7 +306,10 @@ struct QwenStream {
     done: Arc<AtomicBool>,
 }
 impl AgentStream for QwenStream {
-    fn poll_next(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<AgentItem>> {
+    fn poll_next(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<StreamItem>> {
         self.source.poll_next(cx).map(|item| {
             item.map(|mut item| {
                 if let AgentEvent::Error { message } = &mut item.event
@@ -323,10 +317,10 @@ impl AgentStream for QwenStream {
                 {
                     *message = with_auth_hint(message);
                 }
-                AgentItem {
+                StreamItem::Event(AgentItem {
                     event: item.event,
                     raw: item.raw,
-                }
+                })
             })
         })
     }

@@ -4,7 +4,10 @@ import { useApp } from "../state/context";
 import { emptyTranscript } from "../state/transcript";
 import { BlockView } from "./Blocks";
 
-export function TranscriptView({ threadId }: { threadId: string }) {
+export function TranscriptView({ threadId, remembersApprovals }: {
+  threadId: string;
+  remembersApprovals: boolean;
+}) {
   const transcript = useApp((s) => s.transcripts[threadId] ?? emptyTranscript);
   const answer = useApp((s) => s.answerApproval);
   const { blocks } = transcript;
@@ -51,7 +54,7 @@ export function TranscriptView({ threadId }: { threadId: string }) {
               className="row"
               style={{ transform: `translateY(${row.start}px)` }}
             >
-              <BlockView block={block} onAnswer={(id, d) => void answer(id, d)} />
+              <BlockView block={block} remembersApprovals={remembersApprovals} onAnswer={(id, d) => void answer(id, d)} />
             </div>
           );
         })}

@@ -1,34 +1,36 @@
 //! The engine against the replay stub (`qwen-replay`) and a real store.
 
 use hearth_adapter_qwen::SpawnConfig;
-use hearth_engine::agents::qwen::AgentLauncher;
+use hearth_engine::AgentStatus;
+use hearth_engine::agents::claude::ClaudeAdapter;
+use hearth_engine::agents::qwen::{AgentLauncher, QwenAdapter};
+use hearth_engine::agents::{AgentAdapter, AgentFuture, OpenSession, Registration};
 use hearth_engine::{Engine, EngineConfig, EventSink, ThreadEventPayload};
 use hearth_protocol::{AgentEvent, AgentId, ApprovalDecision, StopReason, ThreadId, UserInput};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
 /// `qwen-replay` sits in the target profile directory, some levels above the
 /// test binary; build it if it is not there.
-fn replay_bin() -> PathBuf {
+fn replay_bin(name: &str, package: &str) -> PathBuf {
     let find = || {
         let exe = std::env::current_exe().unwrap();
-        exe.ancestors()
-            .map(|d| d.join("qwen-replay"))
-            .find(|p| p.is_file())
+        exe.ancestors().map(|d| d.join(name)).find(|p| p.is_file())
     };
     if let Some(bin) = find() {
         return bin;
     }
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     let ok = std::process::Command::new(cargo)
-        .args(["build", "-p", "hearth-adapter-qwen", "--bin", "qwen-replay"])
+        .args(["build", "--offline", "-p", package, "--bin", name])
         .status()
         .unwrap()
         .success();
-    assert!(ok, "could not build qwen-replay");
-    find().expect("qwen-replay is not built")
+    assert!(ok, "could not build {name}");
+    find().unwrap_or_else(|| panic!("{name} is not built"))
 }
 
 fn fixture(name: &str) -> PathBuf {
@@ -41,7 +43,8 @@ struct ReplayLauncher(PathBuf);
 
 impl AgentLauncher for ReplayLauncher {
     fn spawn_config(&self, cwd: &Path, _passthrough: &[String]) -> Result<SpawnConfig, String> {
-        let mut c = SpawnConfig::qwen_defaults(replay_bin(), cwd);
+        let mut c =
+            SpawnConfig::qwen_defaults(replay_bin("qwen-replay", "hearth-adapter-qwen"), cwd);
         c.args = vec![self.0.to_string_lossy().into_owned()];
         Ok(c)
     }
@@ -86,9 +89,11 @@ fn engine(
             db_path: Some(w.db.clone()),
             home: w.home.clone(),
             roots: vec![],
-            launcher: Arc::new(hearth_engine::agents::qwen::QwenAdapter(Arc::new(
-                ReplayLauncher(fixture_path),
-            ))),
+            agents: vec![Registration {
+                id: AgentId::QwenCode,
+                label: "Qwen Code",
+                adapter: Arc::new(QwenAdapter(Arc::new(ReplayLauncher(fixture_path)))),
+            }],
         },
         Arc::new(ChannelSink(tx)),
     )
@@ -100,10 +105,11 @@ fn say(t: &str) -> UserInput {
     UserInput::Text { text: t.into() }
 }
 
-fn thread_of(engine: &Engine, w: &World) -> ThreadId {
+async fn thread_of(engine: &Engine, w: &World) -> ThreadId {
     let project = engine.add_project(w.project.to_str().unwrap()).unwrap();
     engine
         .create_thread(&project.id, AgentId::QwenCode)
+        .await
         .unwrap()
         .id
 }
@@ -141,7 +147,7 @@ fn is_approval(e: &AgentEvent) -> bool {
 async fn send_streams_in_order_and_persists_what_it_emitted() {
     let w = world();
     let (engine, mut rx) = engine(&w, fixture("acp-approval-allowed.jsonl"));
-    let thread = thread_of(&engine, &w);
+    let thread = thread_of(&engine, &w).await;
     engine.send_message(&thread, say("go")).await.unwrap();
     let approval = until(&mut rx, is_approval).await;
     let AgentEvent::ApprovalRequest { request } = &approval.last().unwrap().event else {
@@ -178,7 +184,7 @@ async fn allow_for_thread_answers_the_next_identical_request() {
     let path = w.project.parent().unwrap().join("twice.jsonl");
     std::fs::write(&path, doubled.join("\n")).unwrap();
     let (engine, mut rx) = engine(&w, path);
-    let thread = thread_of(&engine, &w);
+    let thread = thread_of(&engine, &w).await;
 
     engine.send_message(&thread, say("one")).await.unwrap();
     let seen = until(&mut rx, is_approval).await;
@@ -208,7 +214,7 @@ async fn allow_for_thread_answers_the_next_identical_request() {
 async fn cancel_ends_the_turn_cancelled_and_persists_it() {
     let w = world();
     let (engine, mut rx) = engine(&w, fixture("acp-cancel.jsonl"));
-    let thread = thread_of(&engine, &w);
+    let thread = thread_of(&engine, &w).await;
     engine.send_message(&thread, say("count")).await.unwrap();
     engine.cancel_turn(&thread).await.unwrap();
     let seen = until(&mut rx, is_end).await;
@@ -252,7 +258,7 @@ fn long_answer_fixture(w: &World, chunks: usize, stop_reason: &str) -> PathBuf {
 async fn cancel_during_a_long_stream_ends_the_turn_cancelled() {
     let w = world();
     let (engine, mut rx) = engine(&w, long_answer_fixture(&w, 3000, "cancelled"));
-    let thread = thread_of(&engine, &w);
+    let thread = thread_of(&engine, &w).await;
     engine.send_message(&thread, say("count")).await.unwrap();
     until(&mut rx, |e| matches!(e, AgentEvent::TextDelta { .. })).await;
     engine.cancel_turn(&thread).await.unwrap();
@@ -272,7 +278,7 @@ async fn a_cancelled_turn_the_agent_never_ends_is_ended_by_the_engine() {
     let w = world();
     let (engine, mut rx) = engine(&w, long_answer_fixture(&w, 5, "hang"));
     engine.set_cancel_grace(Duration::from_millis(50));
-    let thread = thread_of(&engine, &w);
+    let thread = thread_of(&engine, &w).await;
     engine.send_message(&thread, say("count")).await.unwrap();
     until(&mut rx, |e| matches!(e, AgentEvent::TextDelta { .. })).await;
     engine.cancel_turn(&thread).await.unwrap();
@@ -298,7 +304,7 @@ async fn a_cancelled_turn_the_agent_never_ends_is_ended_by_the_engine() {
 async fn send_returns_the_thread_with_the_agents_current_model() {
     let w = world();
     let (engine, _rx) = engine(&w, fixture("acp-cancel.jsonl"));
-    let thread = thread_of(&engine, &w);
+    let thread = thread_of(&engine, &w).await;
     let summary = engine.send_message(&thread, say("count")).await.unwrap();
     assert_eq!(summary.model, "qwen3.8-flash(openai)");
     assert_eq!(
@@ -313,7 +319,7 @@ async fn send_returns_the_thread_with_the_agents_current_model() {
 async fn reopening_the_database_restores_the_thread_and_keeps_numbering() {
     let w = world();
     let (first, mut rx) = engine(&w, fixture("acp-cancel.jsonl"));
-    let thread = thread_of(&first, &w);
+    let thread = thread_of(&first, &w).await;
     first.send_message(&thread, say("count")).await.unwrap();
     first.cancel_turn(&thread).await.unwrap();
     let emitted = until(&mut rx, is_end).await;
@@ -350,7 +356,7 @@ async fn add_project_refuses_a_protected_folder() {
 async fn reopening_after_a_turn_left_mid_approval_ends_it_and_allows_sending() {
     let w = world();
     let (first, mut rx) = engine(&w, fixture("acp-approval-allowed.jsonl"));
-    let thread = thread_of(&first, &w);
+    let thread = thread_of(&first, &w).await;
     first.send_message(&thread, say("go")).await.unwrap();
     let seen = until(&mut rx, is_approval).await;
     let AgentEvent::ApprovalRequest { request } = &seen.last().unwrap().event else {
@@ -381,4 +387,226 @@ async fn reopening_after_a_turn_left_mid_approval_ends_it_and_allows_sending() {
     second.send_message(&thread, say("again")).await.unwrap();
     let next = until(&mut rx, is_approval).await;
     assert_eq!(next[0].seq, snap.last_seq + 1);
+}
+
+fn claude_adapter(
+    w: &World,
+    scenario: &str,
+    fixture: &Path,
+    expected_resume: Option<&str>,
+) -> ClaudeAdapter {
+    let replay = replay_bin("claude-replay", "hearth-adapter-claude");
+    let script = w.home.join("claude");
+    let check_resume = expected_resume
+        .map(|id| format!("export REPLAY_RESUME='{id}'"))
+        .unwrap_or_default();
+    std::fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+test "$DISABLE_TELEMETRY:$DO_NOT_TRACK:$CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC" = 1:1:1 || exit 1
+export REPLAY_VERSION=2.1.328 REPLAY_SCENARIO='{scenario}' REPLAY_FIXTURE='{}'
+{check_resume}
+exec '{}' "$@"
+"#,
+            fixture.display(),
+            replay.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    ClaudeAdapter::new(w.home.clone(), None, Some(script))
+}
+
+fn engine_with_claude(
+    w: &World,
+    adapter: Arc<dyn AgentAdapter>,
+) -> (Engine, mpsc::UnboundedReceiver<ThreadEventPayload>) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let engine = Engine::new(
+        EngineConfig {
+            db_path: Some(w.db.clone()),
+            home: w.home.clone(),
+            roots: vec![],
+            agents: vec![Registration {
+                id: AgentId::ClaudeCode,
+                label: "Claude Code",
+                adapter,
+            }],
+        },
+        Arc::new(ChannelSink(tx)),
+    )
+    .unwrap();
+    (engine, rx)
+}
+
+fn claude_engine(
+    w: &World,
+    scenario: &str,
+    fixture: &Path,
+    expected_resume: Option<&str>,
+) -> (Engine, mpsc::UnboundedReceiver<ThreadEventPayload>) {
+    engine_with_claude(
+        w,
+        Arc::new(claude_adapter(w, scenario, fixture, expected_resume)),
+    )
+}
+
+struct GatedClaude {
+    adapter: ClaudeAdapter,
+    entered: Notify,
+    release: Notify,
+}
+
+impl AgentAdapter for GatedClaude {
+    fn availability(&self) -> AgentFuture<'_, AgentStatus> {
+        self.adapter.availability()
+    }
+
+    fn open_session<'a>(
+        &'a self,
+        cwd: &'a Path,
+        resume_id: Option<&'a str>,
+        passthrough: &'a [String],
+    ) -> AgentFuture<'a, Result<OpenSession, String>> {
+        Box::pin(async move {
+            self.entered.notify_one();
+            self.release.notified().await;
+            self.adapter.open_session(cwd, resume_id, passthrough).await
+        })
+    }
+}
+
+// Fails if Stop during initial session launch submits the cancelled prompt or cancels the next one.
+#[tokio::test]
+async fn cancelling_during_startup_does_not_submit_or_cancel_the_next_turn() {
+    let w = world();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/claude/simple.jsonl");
+    let gated = Arc::new(GatedClaude {
+        adapter: claude_adapter(&w, "simple", &fixture, None),
+        entered: Notify::new(),
+        release: Notify::new(),
+    });
+    let (engine, mut rx) = engine_with_claude(&w, gated.clone());
+    let project = engine.add_project(w.project.to_str().unwrap()).unwrap();
+    let thread = engine
+        .create_thread(&project.id, AgentId::ClaudeCode)
+        .await
+        .unwrap()
+        .id;
+    let sending = tokio::spawn({
+        let engine = engine.clone();
+        let thread = thread.clone();
+        async move {
+            engine
+                .send_message(&thread, say("Must not reach replay"))
+                .await
+        }
+    });
+    gated.entered.notified().await;
+    engine.cancel_turn(&thread).await.unwrap();
+    gated.release.notify_one();
+    sending.await.unwrap().unwrap();
+    let first = until(&mut rx, is_end).await;
+    assert_eq!(first.len(), 1);
+    assert!(matches!(
+        first[0].event,
+        AgentEvent::TurnEnd {
+            stop_reason: StopReason::Cancelled
+        }
+    ));
+
+    engine.send_message(&thread, say("Replay")).await.unwrap();
+    let next = until(&mut rx, is_end).await;
+    assert!(
+        next.iter()
+            .any(|payload| matches!(payload.event, AgentEvent::TextDelta { .. }))
+    );
+    assert!(matches!(
+        next.last().unwrap().event,
+        AgentEvent::TurnEnd {
+            stop_reason: StopReason::EndTurn
+        }
+    ));
+    assert_eq!(engine.load_thread(&thread).unwrap().turns.len(), 2);
+}
+
+// Fails if Claude cannot stream, replay an approval once, persist its native resume ID, or cancel after reopening.
+#[tokio::test]
+async fn claude_thread_streams_approvals_and_resumes_for_cancellation() {
+    let w = world();
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/claude");
+    let approval_path = fixtures.join("approval-allowed.jsonl");
+    let (first, mut rx) = claude_engine(&w, "allow", &approval_path, None);
+    assert!(matches!(
+        first.list_agents().await[0].status,
+        AgentStatus::Ready
+    ));
+    let project = first.add_project(w.project.to_str().unwrap()).unwrap();
+    let thread = first
+        .create_thread(&project.id, AgentId::ClaudeCode)
+        .await
+        .unwrap()
+        .id;
+
+    first.send_message(&thread, say("Replay")).await.unwrap();
+    let before = until(&mut rx, is_approval).await;
+    assert!(
+        before
+            .iter()
+            .any(|event| event.model.as_deref() == Some("claude-haiku-5-5"))
+    );
+    let AgentEvent::ApprovalRequest { request } = &before.last().unwrap().event else {
+        unreachable!()
+    };
+    assert!(
+        first
+            .answer_approval(&thread, &request.id, ApprovalDecision::AllowForThread)
+            .await
+            .is_err()
+    );
+    first
+        .answer_approval(&thread, &request.id, ApprovalDecision::AllowOnce)
+        .await
+        .unwrap();
+    let after = until(&mut rx, is_end).await;
+    assert!(
+        after
+            .iter()
+            .any(|event| matches!(event.event, AgentEvent::TextDelta { .. }))
+    );
+    drop(first);
+
+    let approval_init: serde_json::Value = serde_json::from_str(
+        std::fs::read_to_string(approval_path)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    let session_id = approval_init["session_id"].as_str().unwrap();
+    let (reopened, mut rx) = claude_engine(
+        &w,
+        "interrupt",
+        &fixtures.join("interrupt.jsonl"),
+        Some(session_id),
+    );
+    let snapshot = reopened.load_thread(&thread).unwrap();
+    assert_eq!(snapshot.thread.model, "claude-haiku-5-5");
+    assert_eq!(snapshot.turns.len(), 1);
+    reopened.send_message(&thread, say("Replay")).await.unwrap();
+    until(&mut rx, |event| {
+        matches!(event, AgentEvent::TextDelta { .. })
+    })
+    .await;
+    reopened.cancel_turn(&thread).await.unwrap();
+    let finished = until(&mut rx, is_end).await;
+    assert!(matches!(
+        finished.last().unwrap().event,
+        AgentEvent::TurnEnd {
+            stop_reason: StopReason::Cancelled
+        }
+    ));
+    assert_eq!(reopened.load_thread(&thread).unwrap().turns.len(), 2);
 }

@@ -1,6 +1,9 @@
-use hearth_engine::agents::qwen::QwenLauncher;
+use hearth_engine::agents::Registration;
+use hearth_engine::agents::claude::ClaudeAdapter;
+use hearth_engine::agents::qwen::{QwenAdapter, QwenLauncher};
 use hearth_engine::{
-    Engine, EngineConfig, EventSink, Project, ThreadEventPayload, ThreadSnapshot, ThreadSummary,
+    Engine, EngineConfig, EventSink, InstalledAgent, Project, ThreadEventPayload, ThreadSnapshot,
+    ThreadSummary,
 };
 use hearth_protocol::{AgentId, ApprovalDecision, ApprovalId, ProjectId, ThreadId, UserInput};
 use std::path::PathBuf;
@@ -23,6 +26,11 @@ fn show<E: std::fmt::Display>(e: E) -> String {
 }
 
 #[tauri::command]
+async fn list_agents(engine: State<'_, Engine>) -> Result<Vec<InstalledAgent>, String> {
+    Ok(engine.list_agents().await)
+}
+
+#[tauri::command]
 fn list_projects(engine: State<'_, Engine>) -> Result<Vec<Project>, String> {
     engine.list_projects().map_err(show)
 }
@@ -41,12 +49,12 @@ fn list_threads(
 }
 
 #[tauri::command]
-fn create_thread(
+async fn create_thread(
     engine: State<'_, Engine>,
     project_id: ProjectId,
     agent: AgentId,
 ) -> Result<ThreadSummary, String> {
-    engine.create_thread(&project_id, agent).map_err(show)
+    engine.create_thread(&project_id, agent).await.map_err(show)
 }
 
 #[tauri::command]
@@ -81,8 +89,7 @@ async fn cancel_turn(engine: State<'_, Engine>, thread_id: ThreadId) -> Result<(
     engine.cancel_turn(&thread_id).await.map_err(show)
 }
 
-/// Builds the engine: the database in the app data dir, the user's home as the
-/// guard's home, Qwen found through the login shell.
+/// Registers the agents and opens the local database.
 fn start_engine(app: &tauri::App) -> Result<Engine, Box<dyn std::error::Error>> {
     let data_dir = app.path().app_data_dir()?;
     std::fs::create_dir_all(&data_dir)?;
@@ -91,16 +98,30 @@ fn start_engine(app: &tauri::App) -> Result<Engine, Box<dyn std::error::Error>> 
     // set, this program replaces detecting `qwen`, so a replay stub can stand in.
     let program_override = std::env::var_os("HEARTH_QWEN_PROGRAM").map(PathBuf::from);
     let shell = std::env::var_os("SHELL").map(PathBuf::from);
-    let launcher = Arc::new(QwenLauncher::new(home.clone(), shell, program_override));
-    let warm = launcher.clone();
-    // The login shell can be slow; read its PATH and find `qwen` off the main thread.
-    std::thread::spawn(move || warm.prewarm());
+    let launcher = Arc::new(QwenLauncher::new(
+        home.clone(),
+        shell.clone(),
+        program_override,
+    ));
+    let claude_override = std::env::var_os("HEARTH_CLAUDE_PROGRAM").map(PathBuf::from);
+    let agents = vec![
+        Registration {
+            id: AgentId::QwenCode,
+            label: "Qwen Code",
+            adapter: Arc::new(QwenAdapter(launcher)),
+        },
+        Registration {
+            id: AgentId::ClaudeCode,
+            label: "Claude Code",
+            adapter: Arc::new(ClaudeAdapter::new(home.clone(), shell, claude_override)),
+        },
+    ];
     Ok(Engine::new(
         EngineConfig {
             db_path: Some(data_dir.join("hearth.db")),
             home,
             roots: vec![data_dir],
-            launcher: Arc::new(hearth_engine::agents::qwen::QwenAdapter(launcher)),
+            agents,
         },
         Arc::new(TauriSink(app.handle().clone())),
     )?)
@@ -148,6 +169,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             app_version,
+            list_agents,
             list_projects,
             add_project,
             list_threads,

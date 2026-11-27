@@ -435,10 +435,13 @@ impl Store {
         model: &str,
         external_session_id: &str,
     ) -> Result<()> {
-        self.conn.execute(
+        let affected = self.conn.execute(
             "UPDATE agent_sessions SET model = ?1, external_session_id = ?2 WHERE id = ?3",
             params![model, external_session_id, id.0],
         )?;
+        if affected == 0 {
+            return Err(rusqlite::Error::QueryReturnedNoRows.into());
+        }
         Ok(())
     }
 
