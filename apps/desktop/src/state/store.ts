@@ -1,6 +1,7 @@
 import type { AgentId, ApprovalDecision } from "@hearth/protocol";
 import { createStore, type StoreApi } from "zustand/vanilla";
 import type {
+  InstalledAgent,
   Ipc,
   Project,
   ThreadEventPayload,
@@ -16,6 +17,7 @@ import {
 } from "./transcript";
 
 export type AppState = {
+  agents: InstalledAgent[];
   projects: Project[];
   threads: Record<string, ThreadSummary[]>;
   transcripts: Record<string, Transcript>;
@@ -65,6 +67,7 @@ export function createAppStore(ipc: Ipc, options: Options = {}): AppStore {
   let buffer: ThreadEventPayload[] = [];
   let frameScheduled = false;
   const loading = new Set<string>();
+  const pendingAnswers = new Set<string>();
   let unsubscribe: (() => void) | undefined;
 
   return createStore<AppState>()((set, get) => {
@@ -81,12 +84,25 @@ export function createAppStore(ipc: Ipc, options: Options = {}): AppStore {
       buffer = [];
       set((s) => {
         const transcripts = { ...s.transcripts };
+        let models: Map<string, string> | undefined;
         for (const p of batch) {
           // Events for a thread that is not loaded yet are covered by its snapshot.
+          if (p.model !== undefined) (models ??= new Map()).set(p.threadId, p.model);
           const t = transcripts[p.threadId];
           if (t) transcripts[p.threadId] = applyEvent(t, p.event);
         }
-        return { transcripts };
+        const updatedModels = models;
+        if (!updatedModels) return { transcripts };
+        const threads = Object.fromEntries(
+          Object.entries(s.threads).map(([project, list]) => [
+            project,
+            list.map((thread) => {
+              const model = updatedModels.get(thread.id);
+              return model === undefined || model === thread.model ? thread : { ...thread, model };
+            }),
+          ]),
+        );
+        return { transcripts, threads };
       });
     };
 
@@ -99,6 +115,7 @@ export function createAppStore(ipc: Ipc, options: Options = {}): AppStore {
     };
 
     return {
+      agents: [],
       projects: [],
       threads: {},
       transcripts: {},
@@ -111,6 +128,7 @@ export function createAppStore(ipc: Ipc, options: Options = {}): AppStore {
       },
       async init() {
         unsubscribe ??= ipc.onThreadEvent(enqueue);
+        const detection = ipc.listAgents().then((agents) => set({ agents }), fail);
         try {
           const projects = await ipc.listProjects();
           const lists = await Promise.all(projects.map((p) => ipc.listThreads(p.id)));
@@ -121,6 +139,7 @@ export function createAppStore(ipc: Ipc, options: Options = {}): AppStore {
         } catch (e) {
           fail(e);
         }
+        await detection;
       },
       async addProject(path) {
         try {
@@ -155,6 +174,12 @@ export function createAppStore(ipc: Ipc, options: Options = {}): AppStore {
           buffer = buffer.filter((p) => p.threadId !== threadId);
           set((s) => ({
             transcripts: { ...s.transcripts, [threadId]: transcriptFromTurns(snapshot.turns) },
+            threads: {
+              ...s.threads,
+              [snapshot.thread.projectId]: (s.threads[snapshot.thread.projectId] ?? []).map(
+                (thread) => thread.id === threadId ? snapshot.thread : thread,
+              ),
+            },
           }));
         } catch (e) {
           fail(e);
@@ -174,7 +199,9 @@ export function createAppStore(ipc: Ipc, options: Options = {}): AppStore {
             threads: Object.fromEntries(
               Object.entries(s.threads).map(([project, list]) => [
                 project,
-                list.map((t) => (t.id === summary.id ? summary : t)),
+                list.map((t) =>
+                  t.id === summary.id ? { ...summary, model: summary.model || t.model } : t,
+                ),
               ]),
             ),
           }));
@@ -186,11 +213,16 @@ export function createAppStore(ipc: Ipc, options: Options = {}): AppStore {
       async answerApproval(approvalId, decision) {
         const threadId = get().activeThreadId;
         if (!threadId) return;
-        setTranscript(threadId, (t) => answerApprovalBlock(t, approvalId, decision));
+        const pending = JSON.stringify([threadId, approvalId]);
+        if (pendingAnswers.has(pending)) return;
+        pendingAnswers.add(pending);
         try {
           await ipc.answerApproval(threadId, approvalId, decision);
+          setTranscript(threadId, (t) => answerApprovalBlock(t, approvalId, decision));
         } catch (e) {
           fail(e);
+        } finally {
+          pendingAnswers.delete(pending);
         }
       },
       async cancel() {

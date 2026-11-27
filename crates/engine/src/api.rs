@@ -22,6 +22,23 @@ pub struct ThreadSummary {
     pub model: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum AgentStatus {
+    Ready,
+    Missing,
+    Unsupported { version: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstalledAgent {
+    pub id: AgentId,
+    pub label: &'static str,
+    pub status: AgentStatus,
+    pub remembers_approvals: bool,
+}
+
 /// One user message and the agent events it produced, in order.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -49,6 +66,8 @@ pub struct ThreadEventPayload {
     pub thread_id: ThreadId,
     pub turn_id: TurnId,
     pub seq: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     pub event: AgentEvent,
 }
 

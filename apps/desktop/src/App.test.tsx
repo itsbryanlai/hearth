@@ -2,7 +2,7 @@ import type { AgentEvent, ApprovalDecision } from "@hearth/protocol";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { App } from "./App";
-import type { Ipc, ThreadEventPayload, ThreadSnapshot } from "./ipc/contract";
+import type { InstalledAgent, Ipc, ThreadEventPayload, ThreadSnapshot } from "./ipc/contract";
 import { createMockIpc } from "./ipc/mock";
 import { createAppStore, nextFrame } from "./state/store";
 
@@ -36,9 +36,23 @@ function frames() {
   };
 }
 
+const QWEN: InstalledAgent = {
+  id: "qwen-code",
+  label: "Qwen Code",
+  status: { kind: "ready" },
+  remembersApprovals: true,
+};
+const CLAUDE: InstalledAgent = {
+  id: "claude-code",
+  label: "Claude Code",
+  status: { kind: "ready" },
+  remembersApprovals: false,
+};
+
 function fakeIpc(snapshot: ThreadSnapshot = { thread: THREAD, turns: [], lastSeq: 0 }) {
   let emit: (p: ThreadEventPayload) => void = () => {};
   const ipc = {
+    listAgents: vi.fn(async (): Promise<InstalledAgent[]> => [{ ...CLAUDE, remembersApprovals: true }]),
     listProjects: vi.fn(async () => [{ id: "p", name: "proj", path: "/work/proj" }]),
     addProject: vi.fn(),
     listThreads: vi.fn(async () => [THREAD]),
@@ -92,8 +106,14 @@ test.each([
     request: { id: "a9", tool: "Bash", title: "Run tests", detail: "cargo test", options: [] },
   });
   f.run();
-  fireEvent.click(await screen.findByRole("button", { name: label }));
-  expect(ipc.answerApproval).toHaveBeenCalledWith("th", "a9", decision);
+  let accept = () => {};
+  ipc.answerApproval.mockImplementationOnce(() => new Promise<void>((resolve) => { accept = resolve; }));
+  const button = await screen.findByRole("button", { name: label });
+  fireEvent.click(button);
+  fireEvent.click(button);
+  expect(ipc.answerApproval).toHaveBeenCalledExactlyOnceWith("th", "a9", decision);
+  expect(screen.getByRole("button", { name: label })).toBe(button);
+  await act(async () => accept());
   expect(screen.queryByRole("button", { name: label })).toBeNull();
 });
 
@@ -196,4 +216,46 @@ test("the frame scheduler falls back to a timer and runs once", () => {
   expect(cb).toHaveBeenCalledTimes(1);
   vi.unstubAllGlobals();
   vi.useRealTimers();
+});
+
+// Fails if the selector ignores availability or sends the default agent instead of the chosen one.
+test.each([
+  { status: { kind: "ready" }, expected: CLAUDE.id },
+  { status: { kind: "unsupported", version: "1.0.0" }, expected: QWEN.id },
+] satisfies { status: InstalledAgent["status"]; expected: InstalledAgent["id"] }[])(
+  "new thread routes to an available agent when Claude is $status.kind",
+  async ({ status, expected }) => {
+    const { ipc } = fakeIpc();
+    ipc.listAgents.mockResolvedValue([QWEN, { ...CLAUDE, status }]);
+    ipc.createThread.mockResolvedValue({ ...THREAD, agent: expected });
+    const store = createAppStore(ipc);
+    render(<App store={store} />);
+    const button = await screen.findByRole("button", { name: "+ Thread" });
+    await vi.waitFor(() => expect(button).not.toHaveProperty("disabled", true));
+    fireEvent.click(button);
+    const selector = screen.getByRole("combobox", { name: "Agent" });
+    if (status.kind === "ready") {
+      fireEvent.change(selector, { target: { value: CLAUDE.id } });
+    } else {
+      expect(within(selector).getByRole("option", { name: /Claude Code.*unsupported version 1.0.0/ }))
+        .toHaveProperty("disabled", true);
+    }
+    fireEvent.click(screen.getByRole("button", { name: "Create thread" }));
+    await vi.waitFor(() => expect(ipc.createThread).toHaveBeenCalledWith("p", expected));
+  },
+);
+
+// Fails if an agent without a known approval scope offers a remembered approval.
+test("an unscoped approval only offers one-shot choices", async () => {
+  const { ipc, send } = fakeIpc();
+  ipc.listAgents.mockResolvedValue([CLAUDE]);
+  const { f } = await openThread(ipc);
+  await send({
+    kind: "approval.request",
+    request: { id: "a", tool: "Read", title: "Read file", detail: "", options: [] },
+  });
+  f.run();
+  expect(screen.getByRole("button", { name: "Allow once" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Deny" })).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Allow for this thread" })).toBeNull();
 });

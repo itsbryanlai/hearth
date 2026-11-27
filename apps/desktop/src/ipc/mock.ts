@@ -121,6 +121,9 @@ export function createMockIpc(options: Options = {}): Ipc {
   }
 
   return {
+    async listAgents() {
+      return [{ id: "qwen-code", label: "Qwen Code", status: { kind: "ready" }, remembersApprovals: true }];
+    },
     listProjects: async () => [...projects],
     async addProject(path) {
       const name = path.split("/").filter(Boolean).pop() ?? path;

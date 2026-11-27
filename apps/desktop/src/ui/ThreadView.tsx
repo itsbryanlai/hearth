@@ -11,6 +11,9 @@ export function ThreadView() {
   );
   const running = useApp((s) => (s.activeThreadId ? (s.transcripts[s.activeThreadId]?.running ?? false) : false));
   const error = useApp((s) => s.error);
+  const remembersApprovals = useApp((s) => s.agents.some((agent) =>
+    agent.id === thread?.agent && agent.remembersApprovals,
+  ));
 
   return (
     <main className="thread-view">
@@ -28,7 +31,7 @@ export function ThreadView() {
           {error}
         </div>
       ) : null}
-      {threadId ? <TranscriptView key={threadId} threadId={threadId} /> : <div className="transcript empty" />}
+      {threadId ? <TranscriptView key={threadId} threadId={threadId} remembersApprovals={remembersApprovals} /> : <div className="transcript empty" />}
       <Composer />
     </main>
   );

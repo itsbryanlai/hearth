@@ -6,6 +6,7 @@
   ],
   "permissions": [
     "allow-app-version",
+    "allow-list-agents",
     "allow-list-projects",
     "allow-add-project",
     "allow-list-threads",
