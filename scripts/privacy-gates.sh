@@ -88,7 +88,7 @@ if (( ${#existing[@]} > 0 )); then
         if [[ $hit =~ $re ]]; then ok=1; break; fi
       done
       (( ok )) || fail "hard-coded host '$hit' in $f (add to $ALLOWLIST only if it is a docs link or local-only)"
-    done < <(grep -aoE "https?://[^][:space:]\"'<>)\`]+" "$f" || true)
+    done < <(grep -aoE "https?://[^][:space:]\"'<>)\`;,]+" "$f" || true)
   done < <(git ls-files -- "${existing[@]}")
 fi
 
