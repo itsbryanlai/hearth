@@ -1,6 +1,7 @@
 //! Hearth core: the Rust side that every front end shares.
 
 pub mod fsguard;
+pub mod git;
 pub mod store;
 
 /// The version of Hearth, as set in the workspace manifest.

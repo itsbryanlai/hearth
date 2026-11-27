@@ -29,6 +29,7 @@ export type ThreadSummary = {
   title: string;
   agent: AgentId;
   model: string;
+  branch: string | null;
 };
 
 export type ModelChoice = { id: string; label: string; resolvedId: string | null };
@@ -71,7 +72,8 @@ export interface Ipc {
   listProjects(): Promise<Project[]>;
   addProject(path: string): Promise<Project>;
   listThreads(projectId: ProjectId): Promise<ThreadSummary[]>;
-  createThread(projectId: ProjectId, agent: AgentId): Promise<ThreadSummary>;
+  worktreeInfo(projectId: ProjectId): Promise<{ isGit: boolean; base: string | null; reason: string | null }>;
+  createThread(projectId: ProjectId, agent: AgentId, base: string | null): Promise<ThreadSummary>;
   loadThread(threadId: ThreadId): Promise<ThreadSnapshot>;
   listThreadModels(threadId: ThreadId): Promise<ThreadModels>;
   setThreadModel(threadId: ThreadId, modelId: string): Promise<ThreadSummary>;

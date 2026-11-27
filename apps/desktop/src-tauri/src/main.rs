@@ -49,12 +49,28 @@ fn list_threads(
 }
 
 #[tauri::command]
+async fn worktree_info(
+    engine: State<'_, Engine>,
+    project_id: ProjectId,
+) -> Result<hearth_engine::WorktreeInfo, String> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.worktree_info(&project_id))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(show)
+}
+
+#[tauri::command]
 async fn create_thread(
     engine: State<'_, Engine>,
     project_id: ProjectId,
     agent: AgentId,
+    base: Option<String>,
 ) -> Result<ThreadSummary, String> {
-    engine.create_thread(&project_id, agent).await.map_err(show)
+    engine
+        .create_thread_in(&project_id, agent, base)
+        .await
+        .map_err(show)
 }
 
 #[tauri::command]
@@ -193,6 +209,7 @@ fn main() {
             list_projects,
             add_project,
             list_threads,
+            worktree_info,
             create_thread,
             load_thread,
             list_thread_models,

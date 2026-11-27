@@ -20,6 +20,15 @@ pub struct ThreadSummary {
     pub title: String,
     pub agent: AgentId,
     pub model: String,
+    pub branch: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeInfo {
+    pub is_git: bool,
+    pub base: Option<String>,
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

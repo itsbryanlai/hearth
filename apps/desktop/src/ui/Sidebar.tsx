@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import type { AgentStatus } from "../ipc/contract";
 import { useApp } from "../state/context";
 
@@ -23,6 +23,12 @@ export function Sidebar() {
   const active = useApp((s) => s.activeThreadId);
   const select = useApp((s) => s.selectThread);
   const createThread = useApp((s) => s.createThread);
+  const worktreeInfo = useApp((s) => s.worktreeInfo);
+  const request = useRef(0);
+  const [info, setInfo] = useState<{ project: string; isGit: boolean; base: string | null; reason: string | null } | null>(null);
+  const [infoError, setInfoError] = useState("");
+  const [mode, setMode] = useState<"repo" | "worktree">("repo");
+  const [base, setBase] = useState("");
   const addProject = useApp((s) => s.addProject);
   const [adding, setAdding] = useState(false);
   const [path, setPath] = useState("");
@@ -40,12 +46,17 @@ export function Sidebar() {
               className="quiet"
               disabled={agents.length === 0}
               onClick={() => {
-                if (agents.length === 1 && ready) {
-                  void createThread(p.id, ready.id);
-                } else {
-                  setAgentId(ready?.id ?? "");
-                  setAgentProject(p.id);
-                }
+                setAgentId(ready?.id ?? "");
+                setAgentProject(p.id);
+                setInfo(null);
+                setInfoError("");
+                const current = ++request.current;
+                void worktreeInfo(p.id).then((result) => {
+                  if (request.current !== current) return;
+                  setInfo({ project: p.id, ...result });
+                  setBase(result.base ?? "");
+                  setMode(result.base ? "worktree" : "repo");
+                }).catch((error: unknown) => { if (request.current === current) setInfoError(String(error)); });
               }}
             >
               + Thread
@@ -57,9 +68,10 @@ export function Sidebar() {
               onSubmit={(event) => {
                 event.preventDefault();
                 const selected = agents.find((agent) => agent.id === agentId);
-                if (selected?.status.kind !== "ready") return;
+                if (selected?.status.kind !== "ready" || info?.project !== p.id) return;
+                request.current++;
                 setAgentProject(null);
-                void createThread(p.id, selected.id);
+                void createThread(p.id, selected.id, mode === "worktree" ? base : null);
               }}
             >
               <select aria-label="Agent" value={agentId} onChange={(event) => setAgentId(event.target.value)}>
@@ -70,8 +82,21 @@ export function Sidebar() {
                   </option>
                 ))}
               </select>
-              <button type="submit" disabled={!ready}>Create thread</button>
-              <button type="button" className="quiet" onClick={() => setAgentProject(null)}>Cancel</button>
+              {info?.project === p.id ? (
+                <>
+                  <label>Working directory
+                    <select aria-label="Working directory" value={mode} onChange={(event) => setMode(event.target.value === "worktree" ? "worktree" : "repo")}>
+                      <option value="repo">Work in repo</option>
+                      <option value="worktree" disabled={!info.isGit}>Work in new worktree</option>
+                    </select>
+                  </label>
+                  {mode === "worktree" ? <label>Base <input aria-label="Base" value={base} onChange={(event) => setBase(event.target.value)} /></label> : null}
+                  {info.reason ? <p>{info.reason}</p> : null}
+                  {info.isGit && !info.base ? <p>No usable current base commit. Choose a base for a worktree.</p> : null}
+                </>
+              ) : infoError ? <p role="alert">{infoError}</p> : <p>Checking project…</p>}
+              <button type="submit" disabled={!ready || info?.project !== p.id || (mode === "worktree" && !base.trim())}>Create thread</button>
+              <button type="button" className="quiet" onClick={() => { request.current++; setAgentProject(null); }}>Cancel</button>
             </form>
           ) : null}
           <ul>
@@ -83,7 +108,7 @@ export function Sidebar() {
                   aria-current={t.id === active}
                   onClick={() => void select(t.id)}
                 >
-                  {t.title}
+                  {t.title}{t.branch ? ` · ${t.branch}` : null}
                 </button>
               </li>
             ))}

@@ -267,6 +267,49 @@ impl Store {
         self.get_thread(&id)
     }
 
+    /// Creates the thread and its first session together, or neither.
+    pub fn create_thread_with_session(
+        &mut self,
+        project: &ProjectId,
+        new: NewThread<'_>,
+        agent: &AgentId,
+    ) -> Result<Thread> {
+        let id = ThreadId::new();
+        let session = AgentSessionId::new();
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            &format!(
+                "INSERT INTO threads (id, project_id, title, cwd, worktree_path, branch, base_ref, status, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, {NOW_MS})"
+            ),
+            params![
+                id.0,
+                project.0,
+                new.title,
+                new.cwd,
+                new.worktree_path,
+                new.branch,
+                new.base_ref,
+                to_text(&ThreadStatus::Idle)?
+            ],
+        )?;
+        tx.execute(
+            &format!(
+                "INSERT INTO agent_sessions (id, thread_id, agent_id, model, permission_mode, external_session_id, started_at)
+                 VALUES (?1, ?2, ?3, '', ?4, NULL, {NOW_MS})"
+            ),
+            params![
+                session.0,
+                id.0,
+                to_text(agent)?,
+                to_text(&PermissionMode::Default)?
+            ],
+        )?;
+        let thread = tx.query_row(THREAD_SELECT_BY_ID, [&id.0], thread_from_row)?;
+        tx.commit()?;
+        Ok(thread)
+    }
+
     pub fn get_thread(&self, id: &ThreadId) -> Result<Thread> {
         Ok(self
             .conn

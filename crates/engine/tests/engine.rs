@@ -50,6 +50,18 @@ impl AgentLauncher for ReplayLauncher {
     }
 }
 
+struct RecordingLauncher {
+    fixture: PathBuf,
+    cwd: Arc<std::sync::Mutex<Vec<PathBuf>>>,
+}
+
+impl AgentLauncher for RecordingLauncher {
+    fn spawn_config(&self, cwd: &Path, passthrough: &[String]) -> Result<SpawnConfig, String> {
+        self.cwd.lock().unwrap().push(cwd.to_path_buf());
+        ReplayLauncher(self.fixture.clone()).spawn_config(cwd, passthrough)
+    }
+}
+
 struct ChannelSink(mpsc::UnboundedSender<ThreadEventPayload>);
 
 impl EventSink for ChannelSink {
@@ -834,4 +846,253 @@ fn model_fixture(w: &World, models: &[&str], switch_ack: bool) -> PathBuf {
     )
     .unwrap();
     path
+}
+
+fn git_in(path: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+fn init_git(w: &World) {
+    git_in(&w.project, &["init", "-q"]);
+    std::fs::write(w.project.join("tracked"), "base").unwrap();
+    git_in(&w.project, &["add", "tracked"]);
+    git_in(
+        &w.project,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "base",
+        ],
+    );
+}
+
+// Fails if creation skips home-configured hooks, changes the source, loses its base, or reopens external metadata.
+#[tokio::test]
+async fn worktree_persists_and_reopens_with_the_source_untouched() {
+    let w = world();
+    init_git(&w);
+    let hooks = w.home.join("hooks");
+    std::fs::create_dir(&hooks).unwrap();
+    let hook = hooks.join("post-checkout");
+    std::fs::write(&hook, "#!/bin/sh\nprintf ran > checkout-marker\n").unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(
+        w.home.join(".gitconfig"),
+        format!("[core]\n hooksPath = {}\n", hooks.display()),
+    )
+    .unwrap();
+    let base = git_in(&w.project, &["rev-parse", "HEAD"]);
+    std::fs::write(w.project.join("tracked"), "dirty").unwrap();
+    let (engine, _) = engine(&w, fixture("acp-cancel.jsonl"));
+    let project = engine.add_project(w.project.to_str().unwrap()).unwrap();
+    let info = engine.worktree_info(&project.id).unwrap();
+    assert!(info.is_git && info.base.is_some());
+    let thread = engine
+        .create_thread_in(&project.id, AgentId::QwenCode, info.base)
+        .await
+        .unwrap();
+    assert!(thread.branch.as_deref().unwrap().starts_with("hearth/"));
+    let store = hearth_core::store::Store::open(&w.db).unwrap();
+    let saved = store.get_thread(&thread.id).unwrap();
+    assert_eq!(saved.base_ref.as_deref(), Some(base.as_str()));
+    assert_eq!(saved.worktree_path.as_deref(), Some(saved.cwd.as_str()));
+    assert_eq!(
+        std::fs::read_to_string(Path::new(&saved.cwd).join("checkout-marker")).unwrap(),
+        "ran"
+    );
+    assert_eq!(
+        std::fs::read_to_string(w.project.join("tracked")).unwrap(),
+        "dirty"
+    );
+    assert_eq!(
+        std::fs::read_to_string(Path::new(&saved.cwd).join("tracked")).unwrap(),
+        "base"
+    );
+    drop(store);
+    drop(engine);
+    let opened_cwds = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let reopened = Engine::new(
+        EngineConfig {
+            db_path: Some(w.db.clone()),
+            home: w.home.clone(),
+            roots: vec![],
+            agents: vec![Registration {
+                id: AgentId::QwenCode,
+                label: "Qwen Code",
+                adapter: Arc::new(QwenAdapter(Arc::new(RecordingLauncher {
+                    fixture: fixture("acp-cancel.jsonl"),
+                    cwd: opened_cwds.clone(),
+                }))),
+            }],
+        },
+        Arc::new(ChannelSink(tx)),
+    )
+    .unwrap();
+    assert_eq!(
+        reopened.load_thread(&thread.id).unwrap().thread.branch,
+        thread.branch
+    );
+    reopened.list_thread_models(&thread.id).await.unwrap();
+    assert_eq!(
+        *opened_cwds.lock().unwrap(),
+        vec![PathBuf::from(&saved.cwd)]
+    );
+    drop(reopened);
+    let external = w.project.parent().unwrap().join("other-metadata");
+    git_in(
+        &w.project,
+        &["init", "--bare", "-q", external.to_str().unwrap()],
+    );
+    std::fs::write(
+        Path::new(&saved.cwd).join(".git"),
+        format!("gitdir: {}\n", external.display()),
+    )
+    .unwrap();
+    let (reopened, _) = self::engine(&w, fixture("acp-cancel.jsonl"));
+    assert!(reopened.list_thread_models(&thread.id).await.is_err());
+}
+
+// Fails if an invalid base or a symlinked destination creates a thread or changes the source.
+#[tokio::test]
+async fn worktree_refuses_invalid_base_and_symlink_destination() {
+    let w = world();
+    init_git(&w);
+    let (engine, _) = engine(&w, fixture("acp-cancel.jsonl"));
+    let project = engine.add_project(w.project.to_str().unwrap()).unwrap();
+    assert!(
+        engine
+            .create_thread_in(&project.id, AgentId::QwenCode, Some("missing-base".into()))
+            .await
+            .is_err()
+    );
+    let outside = w.project.parent().unwrap().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::os::unix::fs::symlink(
+        &outside,
+        w.project.parent().unwrap().join(".hearth-worktrees"),
+    )
+    .unwrap();
+    assert!(
+        engine
+            .create_thread_in(&project.id, AgentId::QwenCode, Some("HEAD".into()))
+            .await
+            .is_err()
+    );
+    assert!(engine.list_threads(&project.id).unwrap().is_empty());
+    assert_eq!(
+        std::fs::read_to_string(w.project.join("tracked")).unwrap(),
+        "base"
+    );
+}
+
+// Fails if ordinary folders or explicit repo-mode threads require a worktree.
+#[tokio::test]
+async fn direct_threads_still_open_in_the_project_folder() {
+    let w = world();
+    let (engine, _) = engine(&w, fixture("acp-cancel.jsonl"));
+    let project = engine.add_project(w.project.to_str().unwrap()).unwrap();
+    assert!(!engine.worktree_info(&project.id).unwrap().is_git);
+    let thread = engine
+        .create_thread(&project.id, AgentId::QwenCode)
+        .await
+        .unwrap();
+    let store = hearth_core::store::Store::open(&w.db).unwrap();
+    let saved = store.get_thread(&thread.id).unwrap();
+    assert_eq!(saved.cwd, project.path);
+    assert!(saved.worktree_path.is_none());
+}
+
+// Fails if Git probes external common metadata for a new worktree or blocks direct threads.
+#[tokio::test]
+async fn external_git_metadata_refuses_worktrees_but_allows_direct_threads() {
+    let w = world();
+    let metadata = w.project.parent().unwrap().join("separate-metadata");
+    git_in(
+        &w.project,
+        &[
+            "init",
+            "-q",
+            "--separate-git-dir",
+            metadata.to_str().unwrap(),
+        ],
+    );
+    std::fs::write(w.project.join("tracked"), "base").unwrap();
+    git_in(&w.project, &["add", "tracked"]);
+    git_in(
+        &w.project,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "base",
+        ],
+    );
+    let (engine, _) = engine(&w, fixture("acp-cancel.jsonl"));
+    let project = engine.add_project(w.project.to_str().unwrap()).unwrap();
+    let info = engine.worktree_info(&project.id).unwrap();
+    assert!(!info.is_git);
+    assert!(info.reason.unwrap().contains("outside the project"));
+    let error = engine
+        .create_thread_in(&project.id, AgentId::QwenCode, Some("HEAD".into()))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("outside the project"));
+    assert!(
+        !w.project
+            .parent()
+            .unwrap()
+            .join(".hearth-worktrees")
+            .exists()
+    );
+    engine
+        .create_thread(&project.id, AgentId::QwenCode)
+        .await
+        .unwrap();
+
+    let linked_world = world();
+    init_git(&linked_world);
+    let linked = linked_world.project.parent().unwrap().join("linked");
+    git_in(
+        &linked_world.project,
+        &["worktree", "add", "-qb", "linked", linked.to_str().unwrap()],
+    );
+    let (linked_engine, _) = self::engine(&linked_world, fixture("acp-cancel.jsonl"));
+    let linked_project = linked_engine.add_project(linked.to_str().unwrap()).unwrap();
+    assert!(
+        linked_engine
+            .worktree_info(&linked_project.id)
+            .unwrap()
+            .reason
+            .unwrap()
+            .contains("outside the project")
+    );
+    assert!(
+        linked_engine
+            .create_thread_in(&linked_project.id, AgentId::QwenCode, Some("HEAD".into()))
+            .await
+            .is_err()
+    );
+    linked_engine
+        .create_thread(&linked_project.id, AgentId::QwenCode)
+        .await
+        .unwrap();
 }

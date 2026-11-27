@@ -75,8 +75,8 @@ export function createMockIpc(options: Options = {}): Ipc {
 
   const projects: Project[] = [{ id: "p1", name: "demo", path: "/work/demo" }];
   const threads: ThreadSummary[] = [
-    { id: "th1", projectId: "p1", title: "Fix flaky auth test", agent: "claude-code", model: "opus" },
-    { id: "th2", projectId: "p1", title: "Add retry to the sync job", agent: "qwen-code", model: "qwen3-coder" },
+    { id: "th1", projectId: "p1", title: "Fix flaky auth test", agent: "claude-code", model: "opus", branch: null },
+    { id: "th2", projectId: "p1", title: "Add retry to the sync job", agent: "qwen-code", model: "qwen3-coder", branch: null },
   ];
   const selections = new Map<string, string>();
   const turns = new Map<string, TurnSnapshot[]>([
@@ -140,6 +140,7 @@ export function createMockIpc(options: Options = {}): Ipc {
       return project;
     },
     listThreads: async (projectId) => threads.filter((t) => t.projectId === projectId),
+    worktreeInfo: async () => ({ isGit: false, base: null, reason: null }),
     async createThread(projectId, agent) {
       const thread: ThreadSummary = {
         id: id("th"),
@@ -147,6 +148,7 @@ export function createMockIpc(options: Options = {}): Ipc {
         title: "New thread",
         agent,
         model: agent === "qwen-code" ? "qwen3-coder" : "opus",
+        branch: null,
       };
       threads.push(thread);
       return thread;
