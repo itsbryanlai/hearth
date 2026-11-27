@@ -4,15 +4,15 @@ use crate::agents::{
     AgentItem, AgentSession, AgentStream, EnvPassthrough, Registration, StreamItem,
 };
 use crate::api::{
-    AgentStatus, EngineError, EventSink, InstalledAgent, Project, ThreadEventPayload,
+    AgentStatus, EngineError, EventSink, InstalledAgent, Project, ThreadEventPayload, ThreadModels,
     ThreadSnapshot, ThreadSummary, TurnSnapshot,
 };
 use crate::coalesce::coalesce;
 use hearth_core::fsguard::FsGuard;
 use hearth_core::store::{self, NewEvent, NewThread, Store, ThreadStatus, TurnRole};
 use hearth_protocol::{
-    AgentEvent, AgentId, AgentSessionId, ApprovalDecision, ApprovalId, ApprovalRequest,
-    PermissionMode, ProjectId, StopReason, ThreadId, TurnId, UserInput,
+    AgentEvent, AgentId, ApprovalDecision, ApprovalId, ApprovalRequest, PermissionMode, ProjectId,
+    StopReason, ThreadId, TurnId, UserInput,
 };
 use serde_json::{Value, json};
 use std::collections::{HashMap, hash_map::Entry};
@@ -48,7 +48,7 @@ struct Inner {
     sink: Arc<dyn EventSink>,
     agents: Vec<Registration>,
     sessions: tokio::sync::Mutex<HashMap<ThreadId, Arc<Live>>>,
-    running: Mutex<HashMap<ThreadId, Arc<RunningTurn>>>,
+    work: Mutex<HashMap<ThreadId, ThreadWork>>,
     /// Next `seq` to hand out, per thread.
     seqs: Mutex<HashMap<ThreadId, u64>>,
     cancel_grace_ms: AtomicU64,
@@ -57,9 +57,30 @@ struct Inner {
 /// One live agent process and the approvals it is waiting on.
 struct Live {
     process: Arc<dyn AgentSession>,
+    model: Mutex<LiveModel>,
     remembers_approvals: bool,
     starting: tokio::sync::Mutex<()>,
     pending: Mutex<HashMap<ApprovalId, (ApprovalRequest, TurnId)>>,
+}
+
+#[derive(Default)]
+struct LiveModel {
+    actual: Option<String>,
+    external_id: Option<String>,
+    applied_choice: Option<String>,
+}
+
+enum ThreadWork {
+    Turn(Arc<RunningTurn>),
+    Models,
+}
+
+struct ModelWork<'a>(&'a Inner, &'a ThreadId);
+
+impl Drop for ModelWork<'_> {
+    fn drop(&mut self) {
+        lock(&self.0.work).remove(self.1);
+    }
 }
 
 #[derive(Default)]
@@ -138,7 +159,7 @@ impl Engine {
                 sink,
                 agents: config.agents,
                 sessions: Default::default(),
-                running: Default::default(),
+                work: Default::default(),
                 seqs: Default::default(),
                 cancel_grace_ms: AtomicU64::new(CANCEL_GRACE.as_millis() as u64),
             }),
@@ -268,44 +289,128 @@ impl Engine {
         let summary = thread_summary(&store, &loaded.thread)?;
         let mut turns: Vec<TurnSnapshot> = Vec::new();
         let mut last_seq = 0u64;
-        let mut user_input: Option<UserInput> = None;
-        let mut pending_user = false;
-        for t in loaded.turns {
-            match t.turn.role {
+        let mut pending_user: Option<store::LoadedTurn> = None;
+        for turn in loaded.turns {
+            match turn.turn.role {
                 TurnRole::User => {
-                    if pending_user {
-                        turns.push(snapshot_turn(
-                            &summary,
-                            &t.turn.id,
-                            user_input.take(),
-                            vec![],
-                        ));
+                    if let Some(previous) = pending_user.replace(turn) {
+                        turns.push(snapshot_turn(previous, None));
                     }
-                    user_input = t.turn.input;
-                    pending_user = true;
                 }
                 TurnRole::Assistant => {
-                    last_seq += t.events.len() as u64;
-                    let events = t.events.into_iter().map(|e| e.event).collect();
+                    last_seq += turn.events.len() as u64;
                     turns.push(snapshot_turn(
-                        &summary,
-                        &t.turn.id,
-                        user_input.take(),
-                        events,
+                        turn,
+                        pending_user.take().and_then(|user| user.turn.input),
                     ));
-                    pending_user = false;
                 }
             }
         }
-        if pending_user {
-            // A user message whose agent turn never started.
-            turns.push(snapshot_turn(&summary, &TurnId::new(), user_input, vec![]));
+        if let Some(user) = pending_user {
+            turns.push(snapshot_turn(user, None));
         }
         Ok(ThreadSnapshot {
             thread: summary,
             turns,
             last_seq,
         })
+    }
+
+    pub async fn list_thread_models(&self, thread: &ThreadId) -> Result<ThreadModels, EngineError> {
+        let _work = self.reserve_models(thread)?;
+        let (thread, session, selected) = self.thread_session(thread)?;
+        let live = self.live_session(&thread, &session).await?;
+        let choices = live.process.models().to_vec();
+        let current = lock(&live.model)
+            .actual
+            .clone()
+            .or_else(|| (!session.model.is_empty()).then_some(session.model));
+        Ok(ThreadModels {
+            choices,
+            selected,
+            current,
+        })
+    }
+
+    pub async fn set_thread_model(
+        &self,
+        id: &ThreadId,
+        choice: &str,
+    ) -> Result<ThreadSummary, EngineError> {
+        let _work = self.reserve_models(id)?;
+        let (thread, session, _) = self.thread_session(id)?;
+        let live = self.live_session(&thread, &session).await?;
+        let actual = self.apply_model(&thread.id, &live, choice).await?;
+        let persisted = {
+            let state = lock(&live.model);
+            lock(&self.inner.store).select_model(
+                id,
+                &session.id,
+                choice,
+                &actual,
+                state.external_id.as_deref(),
+            )
+        };
+        if let Err(error) = persisted {
+            evict_session(&self.inner, &live, id).await;
+            return Err(error.into());
+        }
+        thread_summary(&lock(&self.inner.store), &thread)
+    }
+
+    fn reserve_models<'a>(&'a self, thread: &'a ThreadId) -> Result<ModelWork<'a>, EngineError> {
+        match lock(&self.inner.work).entry(thread.clone()) {
+            Entry::Occupied(_) => {
+                Err("Wait for the current turn or model operation to finish.".into())
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(ThreadWork::Models);
+                Ok(ModelWork(&self.inner, thread))
+            }
+        }
+    }
+
+    fn thread_session(
+        &self,
+        id: &ThreadId,
+    ) -> Result<(store::Thread, store::AgentSession, Option<String>), EngineError> {
+        let store = lock(&self.inner.store);
+        let thread = store.get_thread(id)?;
+        let session = store
+            .latest_agent_session(id)?
+            .ok_or("thread has no agent session")?;
+        Ok((thread, session, store.selected_model(id)?))
+    }
+
+    async fn apply_model(
+        &self,
+        thread: &ThreadId,
+        live: &Arc<Live>,
+        id: &str,
+    ) -> Result<String, EngineError> {
+        let choice = live
+            .process
+            .models()
+            .iter()
+            .find(|choice| choice.id == id)
+            .ok_or("This model is no longer available. Choose another model.")?;
+        let switched =
+            tokio::time::timeout(Duration::from_secs(20), live.process.set_model(choice))
+                .await
+                .unwrap_or_else(|_| Err("The agent did not acknowledge the model change.".into()));
+        match switched {
+            Ok(actual) => {
+                let mut state = lock(&live.model);
+                state.applied_choice = Some(choice.id.clone());
+                state.actual = Some(actual.clone());
+                Ok(actual)
+            }
+            Err(error) => {
+                // A failed transport may have lost the acknowledgement after switching.
+                evict_session(&self.inner, live, thread).await;
+                Err(EngineError(error))
+            }
+        }
     }
 
     /// Test hook: shortens the wait for the agent's own end of a cancelled turn.
@@ -325,13 +430,15 @@ impl Engine {
         input: UserInput,
     ) -> Result<ThreadSummary, EngineError> {
         let running = Arc::new(RunningTurn::default());
-        match lock(&self.inner.running).entry(thread.clone()) {
-            Entry::Occupied(_) => return Err("a turn is already running in this thread".into()),
-            Entry::Vacant(entry) => entry.insert(running.clone()),
+        match lock(&self.inner.work).entry(thread.clone()) {
+            Entry::Occupied(_) => {
+                return Err("Wait for the current turn or model operation to finish.".into());
+            }
+            Entry::Vacant(entry) => entry.insert(ThreadWork::Turn(running.clone())),
         };
         let started = self.start_turn(thread, input, running).await;
         if started.is_err() {
-            lock(&self.inner.running).remove(thread);
+            lock(&self.inner.work).remove(thread);
         }
         started
     }
@@ -342,21 +449,27 @@ impl Engine {
         input: UserInput,
         running: Arc<RunningTurn>,
     ) -> Result<ThreadSummary, EngineError> {
-        let (thread, session) = {
-            let store = lock(&self.inner.store);
-            let thread = store.load_thread(thread_id)?.thread;
-            let session = store
-                .latest_agent_session(thread_id)?
-                .ok_or("thread has no agent session")?;
-            (thread, session)
-        };
+        let (thread, session, selected) = self.thread_session(thread_id)?;
         let live = self.live_session(&thread, &session).await?;
         let starting = live.starting.lock().await;
+        if let Some(selected) = selected.as_deref()
+            && !running.cancel_requested.load(Ordering::Acquire)
+            && lock(&live.model).applied_choice.as_deref() != Some(selected)
+        {
+            self.apply_model(thread_id, &live, selected).await?;
+        }
         let (turn, summary) = {
+            let state = lock(&live.model);
             let mut store = lock(&self.inner.store);
-            let user = store.start_turn(thread_id, &session.id, TurnRole::User, None)?;
+            let session_id = match &state.actual {
+                Some(model) => {
+                    store.prepare_turn_session(&session, model, state.external_id.as_deref())?
+                }
+                None => session.id,
+            };
+            let user = store.start_turn(thread_id, &session_id, TurnRole::User, None)?;
             store.set_turn_input(&user.id, &input)?;
-            let turn = store.start_turn(thread_id, &session.id, TurnRole::Assistant, None)?;
+            let turn = store.start_turn(thread_id, &session_id, TurnRole::Assistant, None)?;
             if thread.title == NEW_THREAD_TITLE {
                 let UserInput::Text { text } = &input;
                 let title: String = text.lines().next().unwrap_or("").chars().take(60).collect();
@@ -365,7 +478,7 @@ impl Engine {
                 }
             }
             store.update_thread_status(thread_id, ThreadStatus::Running)?;
-            let thread = store.load_thread(thread_id)?.thread;
+            let thread = store.get_thread(thread_id)?;
             (turn, thread_summary(&store, &thread)?)
         };
         let start = if running.cancel_requested.load(Ordering::Acquire) {
@@ -380,6 +493,7 @@ impl Engine {
             live.clone(),
             thread_id.clone(),
             turn,
+            summary.model.clone(),
             running,
             start,
         ));
@@ -403,16 +517,26 @@ impl Engine {
             .map_err(|d| EngineError(d.to_string()))?;
         let registered = self.registration(&session.agent)?;
         let passthrough = self.passthrough_names(registered.adapter.passthrough())?;
-        let opened = registered
-            .adapter
-            .open_session(&cwd, session.external_session_id.as_deref(), &passthrough)
-            .await
-            .map_err(EngineError)?;
-        if let (Some(model), Some(external)) = (&opened.model, &opened.external_id) {
-            lock(&self.inner.store).update_agent_session(&session.id, model, external)?;
-        }
+        let opened = tokio::time::timeout(
+            Duration::from_secs(30),
+            registered.adapter.open_session(
+                &cwd,
+                session.external_session_id.as_deref(),
+                &passthrough,
+            ),
+        )
+        .await
+        .map_err(|_| EngineError("The agent did not open a session.".into()))?
+        .map_err(EngineError)?;
         let live = Arc::new(Live {
             process: opened.session,
+            model: Mutex::new(LiveModel {
+                actual: opened.model,
+                external_id: opened
+                    .external_id
+                    .or_else(|| session.external_session_id.clone()),
+                applied_choice: None,
+            }),
             remembers_approvals: registered.adapter.remembers_approvals(),
             starting: Default::default(),
             pending: Default::default(),
@@ -477,8 +601,9 @@ impl Engine {
 
     /// Cancels the running turn; it ends with a `turn.end` of `cancelled`.
     pub async fn cancel_turn(&self, thread: &ThreadId) -> Result<(), EngineError> {
-        let Some(running) = lock(&self.inner.running).get(thread).cloned() else {
-            return Ok(());
+        let running = match lock(&self.inner.work).get(thread) {
+            Some(ThreadWork::Turn(running)) => running.clone(),
+            _ => return Ok(()),
         };
         if running.cancel_requested.swap(true, Ordering::AcqRel) {
             return Ok(());
@@ -488,9 +613,8 @@ impl Engine {
         };
         let _starting = live.starting.lock().await;
         if !running.submitted.load(Ordering::Acquire)
-            || !lock(&self.inner.running)
-                .get(thread)
-                .is_some_and(|current| Arc::ptr_eq(current, &running))
+            || !matches!(lock(&self.inner.work).get(thread),
+                Some(ThreadWork::Turn(current)) if Arc::ptr_eq(current, &running))
         {
             return Ok(());
         }
@@ -527,20 +651,15 @@ impl Engine {
     }
 }
 
-fn snapshot_turn(
-    thread: &ThreadSummary,
-    id: &TurnId,
-    input: Option<UserInput>,
-    events: Vec<AgentEvent>,
-) -> TurnSnapshot {
+fn snapshot_turn(turn: store::LoadedTurn, input: Option<UserInput>) -> TurnSnapshot {
     TurnSnapshot {
-        turn_id: id.clone(),
-        agent: thread.agent.clone(),
-        model: thread.model.clone(),
-        input: input.unwrap_or(UserInput::Text {
+        turn_id: turn.turn.id,
+        agent: turn.agent,
+        model: turn.model,
+        input: input.or(turn.turn.input).unwrap_or(UserInput::Text {
             text: String::new(),
         }),
-        events,
+        events: turn.events.into_iter().map(|event| event.event).collect(),
     }
 }
 
@@ -602,12 +721,12 @@ async fn run_turn(
     inner: Arc<Inner>,
     live: Arc<Live>,
     thread: ThreadId,
-    turn: store::Turn,
+    stored_turn: store::Turn,
+    model: String,
     running: Arc<RunningTurn>,
     start: TurnStart,
 ) {
-    let session_id = turn.agent_session_id;
-    let turn = turn.id;
+    let turn = stored_turn.id.clone();
     let mut stream = match start {
         TurnStart::Stream(Ok(stream)) => stream,
         TurnStart::Cancelled => {
@@ -639,7 +758,10 @@ async fn run_turn(
     };
     let mut buf: Vec<AgentItem> = Vec::new();
     let mut deadline: Option<Instant> = None;
-    let mut state = TurnState::default();
+    let mut state = TurnState {
+        model: (!model.is_empty()).then_some(model),
+        ..Default::default()
+    };
     loop {
         let step = match deadline {
             Some(d) => tokio::select! {
@@ -654,10 +776,13 @@ async fn run_turn(
         };
         match step {
             Step::Item(Some(StreamItem::Session { external_id, model })) => {
-                if let Err(message) = save_session(&inner, &session_id, &model, &external_id) {
+                if let Err(message) = save_session(&inner, &stored_turn, &model, &external_id) {
                     fail_stream(&inner, &live, &thread, &turn, &mut state, buf, message).await;
                     return;
                 }
+                let mut native = lock(&live.model);
+                native.actual = Some(model.clone());
+                native.external_id = Some(external_id);
                 state.model = Some(model);
             }
             Step::Item(Some(StreamItem::Failed(message))) => {
@@ -744,12 +869,12 @@ fn cancelled() -> AgentItem {
 
 fn save_session(
     inner: &Inner,
-    id: &AgentSessionId,
+    turn: &store::Turn,
     model: &str,
     external_id: &str,
 ) -> Result<(), String> {
     lock(&inner.store)
-        .update_agent_session(id, model, external_id)
+        .observe_turn_session(turn, model, external_id)
         .map_err(|error| format!("Could not save the agent session: {error}"))
 }
 
@@ -842,7 +967,7 @@ async fn flush(
         };
         let _ = lock(&inner.store).update_thread_status(thread, status);
         // Before the last emit: a client that sends again on `turn.end` must be let in.
-        if let Some(running) = lock(&inner.running).remove(thread) {
+        if let Some(ThreadWork::Turn(running)) = lock(&inner.work).remove(thread) {
             running.finished.notify_one();
         }
     }

@@ -610,3 +610,228 @@ async fn claude_thread_streams_approvals_and_resumes_for_cancellation() {
     ));
     assert_eq!(reopened.load_thread(&thread).unwrap().turns.len(), 2);
 }
+
+// Fails if switching changes the native session, rewrites history, or restores the wrong model.
+#[tokio::test]
+async fn qwen_switch_keeps_native_context_and_historical_labels_across_reopen() {
+    let w = world();
+    let fixture = model_fixture(&w, &["slow", "fast"], true);
+    let (first, mut events) = engine(&w, fixture.clone());
+    let thread = thread_of(&first, &w).await;
+    first
+        .send_message(&thread, say("Earlier request"))
+        .await
+        .unwrap();
+    until(&mut events, is_end).await;
+
+    let options = first.list_thread_models(&thread).await.unwrap();
+    assert_eq!(options.selected, None);
+    assert_eq!(options.current.as_deref(), Some("slow"));
+    assert_eq!(
+        options
+            .choices
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect::<Vec<_>>(),
+        ["slow", "fast"]
+    );
+    assert_eq!(
+        first.set_thread_model(&thread, "fast").await.unwrap().model,
+        "fast"
+    );
+    first
+        .send_message(&thread, say("Next request"))
+        .await
+        .unwrap();
+    until(&mut events, is_end).await;
+    drop(first);
+
+    let (reopened, mut events) = engine(&w, fixture);
+    let snapshot = reopened.load_thread(&thread).unwrap();
+    assert_eq!(snapshot.thread.model, "fast");
+    assert_eq!(
+        snapshot
+            .turns
+            .iter()
+            .map(|turn| turn.model.as_str())
+            .collect::<Vec<_>>(),
+        ["slow", "fast"]
+    );
+    assert_eq!(
+        reopened
+            .list_thread_models(&thread)
+            .await
+            .unwrap()
+            .selected
+            .as_deref(),
+        Some("fast")
+    );
+    assert_eq!(
+        reopened
+            .send_message(&thread, say("After restart"))
+            .await
+            .unwrap()
+            .model,
+        "fast"
+    );
+    until(&mut events, is_end).await;
+    let store = hearth_core::store::Store::open(&w.db).unwrap();
+    let session = store.latest_agent_session(&thread).unwrap().unwrap();
+    assert_eq!(
+        session.external_session_id.as_deref(),
+        Some("same-native-session")
+    );
+    assert_eq!(session.model, "fast");
+}
+
+// Fails if either an unlisted choice or a native control rejection overwrites the current model.
+#[tokio::test]
+async fn rejected_model_change_keeps_the_previous_selection() {
+    let w = world();
+    let (engine, mut events) = engine(&w, model_fixture(&w, &["slow", "fast"], false));
+    let thread = thread_of(&engine, &w).await;
+    engine
+        .send_message(&thread, say("Earlier request"))
+        .await
+        .unwrap();
+    until(&mut events, is_end).await;
+    for rejected in ["unlisted", "fast"] {
+        assert!(engine.set_thread_model(&thread, rejected).await.is_err());
+        assert_eq!(engine.load_thread(&thread).unwrap().thread.model, "slow");
+        assert_eq!(
+            engine.list_thread_models(&thread).await.unwrap().selected,
+            None
+        );
+    }
+}
+
+// Fails if reopening with a removed model silently sends using a different one.
+#[tokio::test]
+async fn removed_saved_model_blocks_sending_until_an_available_choice_is_made() {
+    let w = world();
+    let (first, mut events) = engine(&w, model_fixture(&w, &["slow", "fast"], true));
+    let thread = thread_of(&first, &w).await;
+    first.set_thread_model(&thread, "fast").await.unwrap();
+    first.send_message(&thread, say("Used fast")).await.unwrap();
+    until(&mut events, is_end).await;
+    drop(first);
+
+    let (reopened, mut events) = engine(&w, model_fixture(&w, &["slow"], true));
+    let options = reopened.list_thread_models(&thread).await.unwrap();
+    assert_eq!(options.selected.as_deref(), Some("fast"));
+    assert_eq!(options.choices.len(), 1);
+    assert!(
+        reopened
+            .send_message(&thread, say("Do not send"))
+            .await
+            .is_err()
+    );
+    assert_eq!(reopened.load_thread(&thread).unwrap().turns.len(), 1);
+    assert_eq!(
+        reopened
+            .set_thread_model(&thread, "slow")
+            .await
+            .unwrap()
+            .model,
+        "slow"
+    );
+    reopened
+        .send_message(&thread, say("Used slow"))
+        .await
+        .unwrap();
+    until(&mut events, is_end).await;
+    let turns = reopened.load_thread(&thread).unwrap().turns;
+    assert_eq!(
+        turns
+            .iter()
+            .map(|turn| turn.model.as_str())
+            .collect::<Vec<_>>(),
+        ["fast", "slow"]
+    );
+}
+
+// Fails if a model choice can overlap submission while either operation starts the native session.
+#[tokio::test]
+async fn model_change_and_sending_cannot_overlap_session_startup() {
+    for switching_first in [false, true] {
+        let w = world();
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/claude/simple.jsonl");
+        let gated = Arc::new(GatedClaude {
+            adapter: claude_adapter(&w, "simple", &fixture, None),
+            entered: Notify::new(),
+            release: Notify::new(),
+        });
+        let (engine, mut events) = engine_with_claude(&w, gated.clone());
+        let project = engine.add_project(w.project.to_str().unwrap()).unwrap();
+        let thread = engine
+            .create_thread(&project.id, AgentId::ClaudeCode)
+            .await
+            .unwrap()
+            .id;
+        let first = tokio::spawn({
+            let engine = engine.clone();
+            let thread = thread.clone();
+            async move {
+                if switching_first {
+                    engine.set_thread_model(&thread, "haiku").await
+                } else {
+                    engine.send_message(&thread, say("Replay")).await
+                }
+            }
+        });
+
+        gated.entered.notified().await;
+        if switching_first {
+            assert!(
+                engine
+                    .send_message(&thread, say("Must not reach replay"))
+                    .await
+                    .is_err()
+            );
+        } else {
+            assert!(engine.set_thread_model(&thread, "haiku").await.is_err());
+        }
+        gated.release.notify_one();
+        let result = first.await.unwrap().unwrap();
+        if switching_first {
+            assert_eq!(result.model, "claude-haiku-5-5");
+            engine.send_message(&thread, say("Replay")).await.unwrap();
+        }
+        until(&mut events, is_end).await;
+        assert_eq!(engine.load_thread(&thread).unwrap().turns.len(), 1);
+    }
+}
+
+fn model_fixture(w: &World, models: &[&str], switch_ack: bool) -> PathBuf {
+    use serde_json::json;
+    let choices = models
+        .iter()
+        .map(|id| json!({"modelId": id, "name": id}))
+        .collect::<Vec<_>>();
+    let path = w
+        .project
+        .join(format!("model-{}-{switch_ack}.jsonl", models.join("-")));
+    let models = json!({"currentModelId":models[0],"availableModels":choices});
+    let mut frames = vec![
+        json!({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true}}}),
+        json!({"jsonrpc":"2.0","id":2,"result":{"sessionId":"same-native-session","models":models}}),
+        json!({"jsonrpc":"2.0","id":3,"result":{"modes":{},"models":models}}),
+    ];
+    if switch_ack {
+        frames.push(json!({"jsonrpc":"2.0","id":4,"result":{"_meta":{"qwenModelSwitch":{}}}}));
+    }
+    for id in 5..7 {
+        frames.push(json!({"jsonrpc":"2.0","id":id,"result":{"stopReason":"end_turn"}}));
+    }
+    std::fs::write(
+        &path,
+        frames
+            .into_iter()
+            .map(|frame| frame.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+    path
+}

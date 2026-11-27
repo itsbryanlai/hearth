@@ -2,8 +2,8 @@ use hearth_engine::agents::Registration;
 use hearth_engine::agents::claude::ClaudeAdapter;
 use hearth_engine::agents::qwen::{QwenAdapter, QwenLauncher};
 use hearth_engine::{
-    Engine, EngineConfig, EventSink, InstalledAgent, Project, ThreadEventPayload, ThreadSnapshot,
-    ThreadSummary,
+    Engine, EngineConfig, EventSink, InstalledAgent, Project, ThreadEventPayload, ThreadModels,
+    ThreadSnapshot, ThreadSummary,
 };
 use hearth_protocol::{AgentId, ApprovalDecision, ApprovalId, ProjectId, ThreadId, UserInput};
 use std::path::PathBuf;
@@ -60,6 +60,26 @@ async fn create_thread(
 #[tauri::command]
 fn load_thread(engine: State<'_, Engine>, thread_id: ThreadId) -> Result<ThreadSnapshot, String> {
     engine.load_thread(&thread_id).map_err(show)
+}
+
+#[tauri::command]
+async fn list_thread_models(
+    engine: State<'_, Engine>,
+    thread_id: ThreadId,
+) -> Result<ThreadModels, String> {
+    engine.list_thread_models(&thread_id).await.map_err(show)
+}
+
+#[tauri::command]
+async fn set_thread_model(
+    engine: State<'_, Engine>,
+    thread_id: ThreadId,
+    model_id: String,
+) -> Result<ThreadSummary, String> {
+    engine
+        .set_thread_model(&thread_id, &model_id)
+        .await
+        .map_err(show)
 }
 
 #[tauri::command]
@@ -175,6 +195,8 @@ fn main() {
             list_threads,
             create_thread,
             load_thread,
+            list_thread_models,
+            set_thread_model,
             send_message,
             answer_approval,
             cancel_turn

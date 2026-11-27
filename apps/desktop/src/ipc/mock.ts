@@ -1,6 +1,7 @@
 import type { AgentEvent, ApprovalDecision } from "@hearth/protocol";
 import type {
   Ipc,
+  ModelChoice,
   Project,
   ThreadEventPayload,
   ThreadSnapshot,
@@ -77,6 +78,7 @@ export function createMockIpc(options: Options = {}): Ipc {
     { id: "th1", projectId: "p1", title: "Fix flaky auth test", agent: "claude-code", model: "opus" },
     { id: "th2", projectId: "p1", title: "Add retry to the sync job", agent: "qwen-code", model: "qwen3-coder" },
   ];
+  const selections = new Map<string, string>();
   const turns = new Map<string, TurnSnapshot[]>([
     [
       "th1",
@@ -103,7 +105,8 @@ export function createMockIpc(options: Options = {}): Ipc {
     seqs.set(threadId, seq);
     const turn = turns.get(threadId)?.find((t) => t.turnId === turnId);
     turn?.events.push(event);
-    for (const l of listeners) l({ threadId, turnId, seq, event });
+    const model = turn?.events.length === 1 ? turn.model : undefined;
+    for (const l of listeners) l({ threadId, turnId, seq, model, event });
   }
 
   function play(threadId: string, turnId: string, queue: AgentEvent[], done: () => void) {
@@ -118,6 +121,11 @@ export function createMockIpc(options: Options = {}): Ipc {
       schedule(step);
     };
     schedule(step);
+  }
+
+  function choicesFor(thread: ThreadSummary): ModelChoice[] {
+    const models = thread.agent === "claude-code" ? ["opus", "sonnet"] : ["qwen3-coder", "qwen3"];
+    return models.map((id) => ({ id, label: id, resolvedId: null }));
   }
 
   return {
@@ -151,6 +159,22 @@ export function createMockIpc(options: Options = {}): Ipc {
         turns: (turns.get(threadId) ?? []).map((t) => ({ ...t, events: [...t.events] })),
         lastSeq: seqs.get(threadId) ?? 0,
       };
+    },
+    async listThreadModels(threadId) {
+      const thread = threads.find((t) => t.id === threadId);
+      if (!thread) throw new Error(`unknown thread ${threadId}`);
+      return { choices: choicesFor(thread), selected: selections.get(threadId) ?? null, current: thread.model };
+    },
+    async setThreadModel(threadId, modelId) {
+      const index = threads.findIndex((t) => t.id === threadId);
+      const thread = threads[index];
+      if (!thread) throw new Error(`unknown thread ${threadId}`);
+      if (running.has(threadId)) throw new Error("Wait for the current turn to finish.");
+      if (!choicesFor(thread).some((choice) => choice.id === modelId)) throw new Error("This model is no longer available.");
+      const updated = { ...thread, model: modelId };
+      threads[index] = updated;
+      selections.set(threadId, modelId);
+      return updated;
     },
     async sendMessage(threadId, input) {
       const thread = threads.find((t) => t.id === threadId);

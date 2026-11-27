@@ -2,7 +2,7 @@ use super::login_shell_output;
 use super::{
     AgentAdapter, AgentFuture, AgentItem, AgentSession, AgentStream, OpenSession, StreamItem,
 };
-use crate::api::AgentStatus;
+use crate::api::{AgentStatus, ModelChoice};
 use hearth_adapter_claude::{ClaudeProcess, Error, Item, SpawnConfig, TurnStream};
 use hearth_protocol::{ApprovalDecision, ApprovalRequest, UserInput};
 use std::ffi::{OsStr, OsString};
@@ -142,8 +142,17 @@ impl AgentAdapter for ClaudeAdapter {
             let process = ClaudeProcess::spawn(&config)
                 .await
                 .map_err(|error| error.to_string())?;
+            let models = process
+                .models()
+                .iter()
+                .map(|model| ModelChoice {
+                    id: model.value.clone(),
+                    label: model.label.clone(),
+                    resolved_id: model.resolved_id.clone(),
+                })
+                .collect();
             Ok(OpenSession {
-                session: Arc::new(ClaudeSession(process)),
+                session: Arc::new(ClaudeSession { process, models }),
                 external_id: None,
                 model: None,
             })
@@ -151,19 +160,39 @@ impl AgentAdapter for ClaudeAdapter {
     }
 }
 
-struct ClaudeSession(ClaudeProcess);
+struct ClaudeSession {
+    process: ClaudeProcess,
+    models: Vec<ModelChoice>,
+}
 
 impl AgentSession for ClaudeSession {
     fn prompt(&self, input: UserInput) -> AgentFuture<'_, Result<Box<dyn AgentStream>, String>> {
         Box::pin(async move {
             let UserInput::Text { text } = input;
             let source = self
-                .0
+                .process
                 .prompt(&text)
                 .await
                 .map_err(|error| error.to_string())?;
             let stream: Box<dyn AgentStream> = Box::new(ClaudeStream(source));
             Ok(stream)
+        })
+    }
+
+    fn models(&self) -> &[ModelChoice] {
+        &self.models
+    }
+
+    fn set_model<'a>(&'a self, choice: &'a ModelChoice) -> AgentFuture<'a, Result<String, String>> {
+        Box::pin(async move {
+            let actual = self
+                .process
+                .set_model(&choice.id)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(actual
+                .or_else(|| choice.resolved_id.clone())
+                .unwrap_or_else(|| choice.id.clone()))
         })
     }
 
@@ -179,7 +208,7 @@ impl AgentSession for ClaudeSession {
         decision: ApprovalDecision,
     ) -> AgentFuture<'a, Result<(), String>> {
         Box::pin(async move {
-            self.0
+            self.process
                 .answer(&request.id, decision)
                 .await
                 .map_err(|error| error.to_string())
@@ -187,7 +216,12 @@ impl AgentSession for ClaudeSession {
     }
 
     fn cancel(&self) -> AgentFuture<'_, Result<(), String>> {
-        Box::pin(async move { self.0.interrupt().await.map_err(|error| error.to_string()) })
+        Box::pin(async move {
+            self.process
+                .interrupt()
+                .await
+                .map_err(|error| error.to_string())
+        })
     }
 }
 

@@ -1,16 +1,18 @@
 import { useState } from "react";
 import { useApp } from "../state/context";
+import { modelPickerBusy } from "../state/store";
 
 export function Composer() {
   const threadId = useApp((s) => s.activeThreadId);
   const running = useApp((s) => (s.activeThreadId ? (s.transcripts[s.activeThreadId]?.running ?? false) : false));
+  const changingModel = useApp((s) => threadId !== null && modelPickerBusy(s.modelPickers[threadId]));
   const send = useApp((s) => s.send);
   const cancel = useApp((s) => s.cancel);
   const [text, setText] = useState("");
   const disabled = threadId === null;
 
   const submit = () => {
-    if (text.trim() === "" || running) return;
+    if (text.trim() === "" || running || changingModel) return;
     void send(text);
     setText("");
   };
@@ -41,7 +43,7 @@ export function Composer() {
             Stop
           </button>
         ) : null}
-        <button type="button" className="primary" disabled={disabled || running} onClick={submit}>
+        <button type="button" className="primary" disabled={disabled || running || changingModel} onClick={submit}>
           Send
         </button>
       </div>

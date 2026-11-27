@@ -8,6 +8,8 @@ fn main() {
             "list_threads",
             "create_thread",
             "load_thread",
+            "list_thread_models",
+            "set_thread_model",
             "send_message",
             "answer_approval",
             "cancel_turn",
