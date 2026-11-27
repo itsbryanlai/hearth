@@ -9,6 +9,8 @@ tauri-build = { version = "=2.7.6", features = [] }
 
 [dependencies]
 hearth-core = { path = "../../../crates/core" }
+hearth-engine = { path = "../../../crates/engine" }
+hearth-protocol = { path = "../../../crates/protocol" }
 tauri = { version = "=2.12.7", default-features = false, features = ["wry", "common-controls-v6", "dynamic-acl", "x11", "compression"] }
 
 [features]

@@ -6,7 +6,7 @@ mod migrations;
 
 use hearth_protocol::{
     AgentEvent, AgentId, AgentSessionId, ApprovalDecision, ApprovalId, ApprovalRequest, EventId,
-    PermissionMode, ProjectId, ThreadId, TokenUsage, TurnId,
+    PermissionMode, ProjectId, ThreadId, TokenUsage, TurnId, UserInput,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -106,6 +106,16 @@ pub struct Turn {
     pub role: TurnRole,
     pub created_at: i64,
     pub tree_snapshot: Option<String>,
+    /// What the user sent, on a user turn.
+    pub input: Option<UserInput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSession {
+    pub id: AgentSessionId,
+    pub agent: AgentId,
+    pub model: String,
+    pub external_session_id: Option<String>,
 }
 
 /// An event to append: the normalized event plus the agent's raw payload.
@@ -401,6 +411,79 @@ impl Store {
         })
     }
 
+    /// Records what the user sent on a user turn.
+    pub fn set_turn_input(&mut self, turn: &TurnId, input: &UserInput) -> Result<()> {
+        self.conn.execute(
+            "UPDATE turns SET input_json = ?1 WHERE id = ?2",
+            params![serde_json::to_string(input)?, turn.0],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_thread_title(&mut self, id: &ThreadId, title: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE threads SET title = ?1 WHERE id = ?2",
+            params![title, id.0],
+        )?;
+        Ok(())
+    }
+
+    /// Fills in what is learned once the agent process is up.
+    pub fn update_agent_session(
+        &mut self,
+        id: &AgentSessionId,
+        model: &str,
+        external_session_id: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE agent_sessions SET model = ?1, external_session_id = ?2 WHERE id = ?3",
+            params![model, external_session_id, id.0],
+        )?;
+        Ok(())
+    }
+
+    /// The thread's newest agent session.
+    pub fn latest_agent_session(&self, thread: &ThreadId) -> Result<Option<AgentSession>> {
+        let row: Option<(String, String, String, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT id, agent_id, model, external_session_id FROM agent_sessions
+                 WHERE thread_id = ?1 ORDER BY started_at DESC, rowid DESC LIMIT 1",
+                [&thread.0],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        row.map(|(id, agent, model, external_session_id)| {
+            Ok(AgentSession {
+                id: AgentSessionId(id),
+                agent: from_text(&agent)?,
+                model,
+                external_session_id,
+            })
+        })
+        .transpose()
+    }
+
+    /// Assistant turns with no `turn.end` event: turns that were cut off.
+    pub fn unfinished_turns(&self) -> Result<Vec<(ThreadId, TurnId)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT thread_id, id FROM turns WHERE role = 'assistant'
+             AND NOT EXISTS (SELECT 1 FROM events WHERE events.turn_id = turns.id AND kind = 'turn.end')
+             ORDER BY thread_id, seq",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((ThreadId(r.get(0)?), TurnId(r.get(1)?))))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// How many events the thread holds across all its turns.
+    pub fn thread_event_count(&self, thread: &ThreadId) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE turn_id IN (SELECT id FROM turns WHERE thread_id = ?1)",
+            [&thread.0],
+            |r| r.get(0),
+        )?)
+    }
+
     pub fn record_approval(
         &mut self,
         turn: &TurnId,
@@ -495,9 +578,8 @@ impl Store {
 
 const THREAD_SELECT: &str = "SELECT id, project_id, title, cwd, worktree_path, branch, base_ref, status, created_at, archived_at FROM threads";
 const THREAD_SELECT_BY_ID: &str = "SELECT id, project_id, title, cwd, worktree_path, branch, base_ref, status, created_at, archived_at FROM threads WHERE id = ?1";
-const TURN_SELECT: &str =
-    "SELECT id, thread_id, seq, agent_session_id, role, created_at, tree_snapshot FROM turns";
-const TURN_SELECT_BY_ID: &str = "SELECT id, thread_id, seq, agent_session_id, role, created_at, tree_snapshot FROM turns WHERE id = ?1";
+const TURN_SELECT: &str = "SELECT id, thread_id, seq, agent_session_id, role, created_at, tree_snapshot, input_json FROM turns";
+const TURN_SELECT_BY_ID: &str = "SELECT id, thread_id, seq, agent_session_id, role, created_at, tree_snapshot, input_json FROM turns WHERE id = ?1";
 
 fn thread_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Thread> {
     let status: String = r.get(7)?;
@@ -517,6 +599,7 @@ fn thread_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Thread> {
 
 fn turn_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Turn> {
     let role: String = r.get(4)?;
+    let input: Option<String> = r.get(7)?;
     Ok(Turn {
         id: TurnId(r.get(0)?),
         thread_id: ThreadId(r.get(1)?),
@@ -525,6 +608,10 @@ fn turn_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Turn> {
         role: from_text(&role).map_err(json_err)?,
         created_at: r.get(5)?,
         tree_snapshot: r.get(6)?,
+        input: input
+            .map(|t| serde_json::from_str(&t))
+            .transpose()
+            .map_err(|e| json_err(e.into()))?,
     })
 }
 

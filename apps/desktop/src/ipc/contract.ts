@@ -28,7 +28,12 @@ export type TurnSnapshot = {
   events: AgentEvent[];
 };
 
-export type ThreadSnapshot = { thread: ThreadSummary; turns: TurnSnapshot[] };
+export type ThreadSnapshot = {
+  thread: ThreadSummary;
+  turns: TurnSnapshot[];
+  /** The `seq` of the newest event in `turns`: live events at or below it are already shown. */
+  lastSeq: number;
+};
 
 /** Payload of the `thread-event` channel. `seq` increases per thread. */
 export type ThreadEventPayload = {

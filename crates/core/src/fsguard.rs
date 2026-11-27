@@ -94,6 +94,14 @@ impl FsGuard {
         Self { roots, homes }
     }
 
+    /// Allows one more root (a project the user added).
+    pub fn add_root(&mut self, root: &Path) {
+        let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        if !self.roots.contains(&root) {
+            self.roots.push(root);
+        }
+    }
+
     /// The verdict without the debug panic. Prefer [`FsGuard::check`].
     pub fn try_check(&self, path: &Path) -> Result<CanonicalPath, Denied> {
         let canon = path

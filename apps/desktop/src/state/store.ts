@@ -41,9 +41,25 @@ type Options = {
   defaultAgent?: AgentId;
 };
 
+/**
+ * Runs `cb` once, on the next animation frame or after 100 ms, whichever comes
+ * first. WebKit pauses animation frames while the window is hidden or covered,
+ * and events must still be applied then.
+ */
+export function nextFrame(cb: () => void): void {
+  let done = false;
+  const run = () => {
+    if (done) return;
+    done = true;
+    cb();
+  };
+  requestAnimationFrame(run);
+  setTimeout(run, 100);
+}
+
 export function createAppStore(ipc: Ipc, options: Options = {}): AppStore {
-  const raf = options.raf ?? ((cb) => void requestAnimationFrame(() => cb()));
-  const defaultAgent = options.defaultAgent ?? "claude-code";
+  const raf = options.raf ?? nextFrame;
+  const defaultAgent = options.defaultAgent ?? "qwen-code";
 
   // Events wait here and are applied together, once per frame, however many arrive.
   let buffer: ThreadEventPayload[] = [];
