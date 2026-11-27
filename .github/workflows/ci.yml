@@ -70,3 +70,8 @@ jobs:
 
       - run: scripts/privacy-gates.sh
       - run: bash scripts/tests/test-privacy-gates.sh
+
+      - name: Egress test (no network connections from Hearth processes)
+        run: bash tests/privacy/egress-test.sh
+      - name: Egress test self-check (planted connections must be caught)
+        run: bash tests/privacy/egress-test.sh --self-test
