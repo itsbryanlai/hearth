@@ -17,7 +17,7 @@ use hearth_protocol::{
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use tokio::time::Instant;
@@ -51,6 +51,7 @@ struct Inner {
     running: Mutex<HashSet<ThreadId>>,
     /// Next `seq` to hand out, per thread.
     seqs: Mutex<HashMap<ThreadId, u64>>,
+    cancel_grace_ms: AtomicU64,
 }
 
 /// One live agent process and the approvals it is waiting on.
@@ -60,7 +61,16 @@ struct Live {
     /// False until a turn has run on this session; an auth failure before
     /// that gets the setup hint.
     turn_done: AtomicBool,
+    /// Counts turns on this session; a cancel names the turn it was for.
+    turn_seq: AtomicU64,
+    /// Set (with `force_end` notified) when a cancelled turn got no end from
+    /// the agent in time; holds the number of the turn to end.
+    force_seq: AtomicU64,
+    force_end: tokio::sync::Notify,
 }
+
+/// How long after `session/cancel` the agent has to end the turn itself.
+const CANCEL_GRACE: Duration = Duration::from_secs(3);
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -124,6 +134,7 @@ impl Engine {
                 sessions: Default::default(),
                 running: Default::default(),
                 seqs: Default::default(),
+                cancel_grace_ms: AtomicU64::new(CANCEL_GRACE.as_millis() as u64),
             }),
         })
     }
@@ -260,12 +271,22 @@ impl Engine {
         })
     }
 
-    /// Stores the user's turn and starts the agent's; events then stream to the sink.
+    /// Test hook: shortens the wait for the agent's own end of a cancelled turn.
+    #[doc(hidden)]
+    pub fn set_cancel_grace(&self, grace: Duration) {
+        self.inner
+            .cancel_grace_ms
+            .store(grace.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// Stores the user's turn and starts the agent's; events then stream to
+    /// the sink. Returns the thread as it is now: the agent's model is known
+    /// once its session has started.
     pub async fn send_message(
         &self,
         thread: &ThreadId,
         input: UserInput,
-    ) -> Result<(), EngineError> {
+    ) -> Result<ThreadSummary, EngineError> {
         if !lock(&self.inner.running).insert(thread.clone()) {
             return Err("a turn is already running in this thread".into());
         }
@@ -276,7 +297,11 @@ impl Engine {
         started
     }
 
-    async fn start_turn(&self, thread_id: &ThreadId, input: UserInput) -> Result<(), EngineError> {
+    async fn start_turn(
+        &self,
+        thread_id: &ThreadId,
+        input: UserInput,
+    ) -> Result<ThreadSummary, EngineError> {
         let (thread, session) = {
             let store = lock(&self.inner.store);
             let thread = store.load_thread(thread_id)?.thread;
@@ -286,7 +311,8 @@ impl Engine {
             (thread, session)
         };
         let live = self.live_session(&thread, &session).await?;
-        let turn = {
+        let seq = live.turn_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let (turn, summary) = {
             let mut store = lock(&self.inner.store);
             let user = store.start_turn(thread_id, &session.id, TurnRole::User, None)?;
             store.set_turn_input(&user.id, &input)?;
@@ -299,7 +325,8 @@ impl Engine {
                 }
             }
             store.update_thread_status(thread_id, ThreadStatus::Running)?;
-            turn
+            let thread = store.load_thread(thread_id)?.thread;
+            (turn, thread_summary(&store, &thread)?)
         };
         let stream = live.process.prompt(input);
         tokio::spawn(run_turn(
@@ -307,9 +334,10 @@ impl Engine {
             live,
             thread_id.clone(),
             turn.id,
+            seq,
             stream,
         ));
-        Ok(())
+        Ok(summary)
     }
 
     /// The thread's live session; spawns the agent (and resumes its stored
@@ -351,12 +379,18 @@ impl Engine {
             Some(r) => r,
             None => process.new_session(&cwd).await.map_err(fail)?,
         };
-        let model = models.first().map(|m| m.id.clone()).unwrap_or_default();
+        let model = models
+            .current
+            .or_else(|| models.available.first().map(|m| m.id.clone()))
+            .unwrap_or_default();
         lock(&self.inner.store).update_agent_session(&session.id, &model, &external)?;
         let live = Arc::new(Live {
             process,
             pending: Default::default(),
             turn_done: AtomicBool::new(had_session),
+            turn_seq: AtomicU64::new(0),
+            force_seq: AtomicU64::new(0),
+            force_end: tokio::sync::Notify::new(),
         });
         sessions.insert(thread.id.clone(), live.clone());
         Ok(live)
@@ -408,7 +442,24 @@ impl Engine {
         live.process
             .cancel()
             .await
-            .map_err(|e| EngineError(e.to_string()))
+            .map_err(|e| EngineError(e.to_string()))?;
+        // The agent should end the turn. If it does not, end it here.
+        let (inner, thread, seq) = (
+            self.inner.clone(),
+            thread.clone(),
+            live.turn_seq.load(Ordering::Relaxed),
+        );
+        let grace = Duration::from_millis(inner.cancel_grace_ms.load(Ordering::Relaxed));
+        tokio::spawn(async move {
+            tokio::time::sleep(grace).await;
+            if lock(&inner.running).contains(&thread)
+                && live.turn_seq.load(Ordering::Relaxed) == seq
+            {
+                live.force_seq.store(seq, Ordering::Relaxed);
+                live.force_end.notify_one();
+            }
+        });
+        Ok(())
     }
 
     async fn running_session(&self, thread: &ThreadId) -> Result<Arc<Live>, EngineError> {
@@ -514,6 +565,8 @@ struct TurnState {
 enum Step {
     Item(Option<AdapterItem>),
     Tick,
+    /// The agent did not end a cancelled turn in time.
+    ForceEnd,
 }
 
 /// Streams one turn: persists and emits in batches (every 16 ms, or at once
@@ -523,6 +576,7 @@ async fn run_turn(
     live: Arc<Live>,
     thread: ThreadId,
     turn: TurnId,
+    seq: u64,
     mut stream: AdapterStream,
 ) {
     let mut buf: Vec<AdapterItem> = Vec::new();
@@ -533,8 +587,12 @@ async fn run_turn(
             Some(d) => tokio::select! {
                 item = stream.next() => Step::Item(item),
                 () = tokio::time::sleep_until(d) => Step::Tick,
+                () = live.force_end.notified() => Step::ForceEnd,
             },
-            None => Step::Item(stream.next().await),
+            None => tokio::select! {
+                item = stream.next() => Step::Item(item),
+                () = live.force_end.notified() => Step::ForceEnd,
+            },
         };
         match step {
             Step::Item(Some(item)) => {
@@ -567,6 +625,29 @@ async fn run_turn(
                 )
                 .await;
                 deadline = None;
+            }
+            Step::ForceEnd => {
+                if live.force_seq.load(Ordering::Relaxed) != seq {
+                    continue;
+                }
+                // What arrived is kept; the late answer of the agent is dropped.
+                buf.push(AdapterItem {
+                    event: AgentEvent::TurnEnd {
+                        stop_reason: StopReason::Cancelled,
+                    },
+                    raw: Value::Null,
+                });
+                flush(
+                    &inner,
+                    &live,
+                    &thread,
+                    &turn,
+                    &mut state,
+                    std::mem::take(&mut buf),
+                    true,
+                )
+                .await;
+                return;
             }
             Step::Item(None) => {
                 flush(

@@ -96,9 +96,17 @@ pub struct AgentInfo {
     pub version: String,
 }
 
+/// What the agent reports about models for a session.
+#[derive(Debug, Default)]
+pub struct SessionModels {
+    /// The model the session is using now (`currentModelId`).
+    pub current: Option<String>,
+    pub available: Vec<Model>,
+}
+
 #[derive(Debug)]
 pub struct LoadedSession {
-    pub models: Vec<Model>,
+    pub models: SessionModels,
     /// The replayed history, in order.
     pub history: Vec<AdapterItem>,
 }
@@ -300,7 +308,7 @@ impl QwenProcess {
         })
     }
 
-    pub async fn new_session(&self, cwd: &Path) -> Result<(String, Vec<Model>), AdapterError> {
+    pub async fn new_session(&self, cwd: &Path) -> Result<(String, SessionModels), AdapterError> {
         let res = self
             .shared
             .request("session/new", json!({"cwd": cwd, "mcpServers": []}))
@@ -422,7 +430,16 @@ impl QwenProcess {
     }
 }
 
-fn models(res: &Value) -> Vec<Model> {
+fn models(res: &Value) -> SessionModels {
+    let current = res
+        .pointer("/models/currentModelId")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let available = available_models(res);
+    SessionModels { current, available }
+}
+
+fn available_models(res: &Value) -> Vec<Model> {
     res.pointer("/models/availableModels")
         .and_then(Value::as_array)
         .into_iter()

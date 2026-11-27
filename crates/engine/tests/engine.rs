@@ -225,6 +225,86 @@ async fn cancel_ends_the_turn_cancelled_and_persists_it() {
     ));
 }
 
+/// A fixture of `chunks` answer chunks, then a turn end of `stop_reason`
+/// (the stub waits for `session/cancel` before a `cancelled` one).
+fn long_answer_fixture(w: &World, chunks: usize, stop_reason: &str) -> PathBuf {
+    let base = std::fs::read_to_string(fixture("acp-cancel.jsonl")).unwrap();
+    let mut out: Vec<String> = base.lines().take(2).map(str::to_owned).collect();
+    let sid = "fff0a4aa-ad95-475a-98f5-729ea9c8c498";
+    for i in 0..chunks {
+        out.push(format!(
+            r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"{sid}","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"{i}\n"}}}}}}}}"#
+        ));
+    }
+    out.push(format!(
+        r#"{{"jsonrpc":"2.0","id":3,"result":{{"stopReason":"{stop_reason}"}}}}"#
+    ));
+    let path = w.home.join(format!("long-{stop_reason}.jsonl"));
+    std::fs::write(&path, out.join("\n")).unwrap();
+    path
+}
+
+// Fails if Stop, pressed while a long answer is still being streamed and
+// saved, does not end the turn as cancelled.
+#[tokio::test]
+async fn cancel_during_a_long_stream_ends_the_turn_cancelled() {
+    let w = world();
+    let (engine, mut rx) = engine(&w, long_answer_fixture(&w, 3000, "cancelled"));
+    let thread = thread_of(&engine, &w);
+    engine.send_message(&thread, say("count")).await.unwrap();
+    until(&mut rx, |e| matches!(e, AgentEvent::TextDelta { .. })).await;
+    engine.cancel_turn(&thread).await.unwrap();
+    let seen = until(&mut rx, is_end).await;
+    assert!(matches!(
+        seen.last().unwrap().event,
+        AgentEvent::TurnEnd {
+            stop_reason: StopReason::Cancelled
+        }
+    ));
+}
+
+// Fails if an agent that ignores `session/cancel` leaves the turn running
+// forever instead of the engine ending it as cancelled.
+#[tokio::test]
+async fn a_cancelled_turn_the_agent_never_ends_is_ended_by_the_engine() {
+    let w = world();
+    let (engine, mut rx) = engine(&w, long_answer_fixture(&w, 5, "hang"));
+    engine.set_cancel_grace(Duration::from_millis(50));
+    let thread = thread_of(&engine, &w);
+    engine.send_message(&thread, say("count")).await.unwrap();
+    until(&mut rx, |e| matches!(e, AgentEvent::TextDelta { .. })).await;
+    engine.cancel_turn(&thread).await.unwrap();
+    let seen = until(&mut rx, is_end).await;
+    assert!(matches!(
+        seen.last().unwrap().event,
+        AgentEvent::TurnEnd {
+            stop_reason: StopReason::Cancelled
+        }
+    ));
+    let snap = engine.load_thread(&thread).unwrap();
+    assert!(matches!(
+        snap.turns[0].events.last(),
+        Some(AgentEvent::TurnEnd {
+            stop_reason: StopReason::Cancelled
+        })
+    ));
+}
+
+// Fails if the model the agent reports for the session is not what the thread
+// shows once a message was sent (a new thread starts with none).
+#[tokio::test]
+async fn send_returns_the_thread_with_the_agents_current_model() {
+    let w = world();
+    let (engine, _rx) = engine(&w, fixture("acp-cancel.jsonl"));
+    let thread = thread_of(&engine, &w);
+    let summary = engine.send_message(&thread, say("count")).await.unwrap();
+    assert_eq!(summary.model, "qwen3.8-flash(openai)");
+    assert_eq!(
+        engine.load_thread(&thread).unwrap().thread.model,
+        summary.model
+    );
+}
+
 // Fails if a reopened thread loses the user's message or events, or its
 // numbering restarts (the UI would then drop or duplicate live events).
 #[tokio::test]

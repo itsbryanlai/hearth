@@ -44,7 +44,7 @@ function fakeIpc(snapshot: ThreadSnapshot = { thread: THREAD, turns: [], lastSeq
     listThreads: vi.fn(async () => [THREAD]),
     createThread: vi.fn(),
     loadThread: vi.fn(async () => snapshot),
-    sendMessage: vi.fn(async () => {}),
+    sendMessage: vi.fn(async () => THREAD),
     answerApproval: vi.fn(async () => {}),
     cancelTurn: vi.fn(async () => {}),
     onThreadEvent: (h: (p: ThreadEventPayload) => void) => {
@@ -108,6 +108,21 @@ test("Cmd+Enter sends the message and clears the composer; plain Enter does not 
   fireEvent.keyDown(box, { key: "Enter", metaKey: true });
   expect(ipc.sendMessage).toHaveBeenCalledWith("th", { kind: "text", text: "fix the test" });
   expect(box.value).toBe("");
+});
+
+// Fails if the header keeps the empty model a new thread starts with, instead of the
+// model the agent reported when the turn started.
+test("the header shows the model the agent reported after the first message", async () => {
+  const fresh = { ...THREAD, model: "" };
+  const { ipc } = fakeIpc({ thread: fresh, turns: [], lastSeq: 0 });
+  ipc.listThreads.mockImplementation(async () => [fresh]);
+  ipc.sendMessage.mockImplementation(async () => ({ ...fresh, model: "qwen4-max" }));
+  await openThread(ipc);
+  expect(screen.queryByText(/qwen4-max/)).toBeNull();
+  const box = screen.getByLabelText("Message");
+  fireEvent.change(box, { target: { value: "hi" } });
+  fireEvent.keyDown(box, { key: "Enter", metaKey: true });
+  expect(await screen.findByText(/qwen4-max/)).toBeTruthy();
 });
 
 // Fails if Cmd+. does not cancel the running turn, or cancels when nothing runs.

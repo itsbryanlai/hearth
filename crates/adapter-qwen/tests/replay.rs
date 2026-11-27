@@ -196,7 +196,8 @@ async fn load_session_returns_the_replayed_history() {
     let p = start("acp-resume-load.jsonl", &[]);
     p.initialize().await.unwrap();
     let loaded = p.load_session("s", &std::env::temp_dir()).await.unwrap();
-    assert!(!loaded.models.is_empty());
+    assert!(!loaded.models.available.is_empty());
+    assert!(loaded.models.current.is_some());
     assert!(
         loaded
             .history

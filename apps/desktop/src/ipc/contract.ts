@@ -55,7 +55,8 @@ export interface Ipc {
   listThreads(projectId: ProjectId): Promise<ThreadSummary[]>;
   createThread(projectId: ProjectId, agent: AgentId): Promise<ThreadSummary>;
   loadThread(threadId: ThreadId): Promise<ThreadSnapshot>;
-  sendMessage(threadId: ThreadId, input: UserInput): Promise<void>;
+  /** Resolves with the thread as it is once the turn started (title, model). */
+  sendMessage(threadId: ThreadId, input: UserInput): Promise<ThreadSummary>;
   answerApproval(
     threadId: ThreadId,
     approvalId: ApprovalId,

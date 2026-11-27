@@ -162,6 +162,7 @@ export function createMockIpc(options: Options = {}): Ipc {
       running.set(threadId, run);
       run.resume = (decision) => play(threadId, turnId, script.after(decision), () => undefined);
       play(threadId, turnId, script.before, () => undefined);
+      return thread;
     },
     async answerApproval(threadId, _approvalId, decision) {
       const run = running.get(threadId);

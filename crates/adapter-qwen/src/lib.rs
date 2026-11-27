@@ -13,5 +13,6 @@ mod client;
 mod mapping;
 
 pub use client::{
-    AdapterError, AdapterItem, AdapterStream, AgentInfo, LoadedSession, QwenProcess, SpawnConfig,
+    AdapterError, AdapterItem, AdapterStream, AgentInfo, LoadedSession, QwenProcess, SessionModels,
+    SpawnConfig,
 };

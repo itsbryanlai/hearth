@@ -168,7 +168,16 @@ export function createAppStore(ipc: Ipc, options: Options = {}): AppStore {
         if (!threadId || body === "" || get().transcripts[threadId]?.running) return;
         setTranscript(threadId, (t) => addUserMessage(t, body));
         try {
-          await ipc.sendMessage(threadId, { kind: "text", text: body });
+          const summary = await ipc.sendMessage(threadId, { kind: "text", text: body });
+          // The agent's model and the title are known only now.
+          set((s) => ({
+            threads: Object.fromEntries(
+              Object.entries(s.threads).map(([project, list]) => [
+                project,
+                list.map((t) => (t.id === summary.id ? summary : t)),
+              ]),
+            ),
+          }));
         } catch (e) {
           setTranscript(threadId, (t) => ({ ...t, running: false }));
           fail(e);
