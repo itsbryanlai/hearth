@@ -1,5 +1,8 @@
 //! Hearth core: the Rust side that every front end shares.
 
+pub mod fsguard;
+pub mod store;
+
 /// The version of Hearth, as set in the workspace manifest.
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
