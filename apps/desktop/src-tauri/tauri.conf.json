@@ -1,0 +1,21 @@
+{
+  "productName": "Hearth",
+  "version": "0.1.0",
+  "identifier": "dev.hearth.app",
+  "build": {
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../dist",
+    "beforeDevCommand": "pnpm dev",
+    "beforeBuildCommand": "pnpm build"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [
+      { "title": "Hearth", "width": 1100, "height": 760 }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' data:"
+    }
+  },
+  "bundle": { "active": false }
+}
