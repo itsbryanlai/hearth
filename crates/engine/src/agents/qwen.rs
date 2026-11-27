@@ -7,7 +7,7 @@ use super::{
     AgentAdapter, AgentFuture, AgentItem, AgentSession, AgentStream, EnvPassthrough, OpenSession,
     StreamItem, login_shell_output, run_limited,
 };
-use crate::api::AgentStatus;
+use crate::api::{AgentStatus, ModelChoice};
 use hearth_adapter_qwen::QwenProcess;
 use hearth_adapter_qwen::SpawnConfig;
 use hearth_protocol::{AgentEvent, ApprovalDecision, ApprovalRequest, UserInput};
@@ -258,6 +258,15 @@ impl AgentAdapter for QwenAdapter {
             Ok(OpenSession {
                 session: Arc::new(QwenSession {
                     process,
+                    models: models
+                        .available
+                        .into_iter()
+                        .map(|model| ModelChoice {
+                            id: model.id,
+                            label: model.label,
+                            resolved_id: None,
+                        })
+                        .collect(),
                     turn_done: Arc::new(AtomicBool::new(had_session)),
                 }),
                 external_id: Some(external_id),
@@ -269,6 +278,7 @@ impl AgentAdapter for QwenAdapter {
 
 struct QwenSession {
     process: QwenProcess,
+    models: Vec<ModelChoice>,
     turn_done: Arc<AtomicBool>,
 }
 impl AgentSession for QwenSession {
@@ -281,6 +291,19 @@ impl AgentSession for QwenSession {
             Ok(stream)
         })
     }
+    fn models(&self) -> &[ModelChoice] {
+        &self.models
+    }
+
+    fn set_model<'a>(&'a self, choice: &'a ModelChoice) -> AgentFuture<'a, Result<String, String>> {
+        Box::pin(async move {
+            self.process.set_model(&choice.id).await.map_err(
+                |_| "Qwen Code could not switch to that model. Choose another model or try again.",
+            )?;
+            Ok(choice.id.clone())
+        })
+    }
+
     fn turn_completed(&self) {
         self.turn_done.store(true, Ordering::Relaxed);
     }

@@ -8,7 +8,7 @@ import type {
 import type { TurnSnapshot } from "../ipc/contract";
 
 export type Block =
-  | { id: number; kind: "user"; text: string }
+  | { id: number; kind: "user"; text: string; replyModel: string }
   | { id: number; kind: "text"; text: string }
   | { id: number; kind: "reasoning"; text: string }
   | {
@@ -26,9 +26,9 @@ export type Block =
   | { id: number; kind: "approval"; request: ApprovalRequest; answer?: ApprovalDecision }
   | { id: number; kind: "error"; message: string };
 
-export type Transcript = { blocks: Block[]; nextId: number; running: boolean };
+export type Transcript = { blocks: Block[]; nextId: number; running: boolean; lastUserIndex: number };
 
-export const emptyTranscript: Transcript = { blocks: [], nextId: 1, running: false };
+export const emptyTranscript: Transcript = { blocks: [], nextId: 1, running: false, lastUserIndex: -1 };
 
 function append(t: Transcript, make: (id: number) => Block): Transcript {
   return { ...t, blocks: [...t.blocks, make(t.nextId)], nextId: t.nextId + 1 };
@@ -54,8 +54,19 @@ function findTool(t: Transcript, toolCallId: string): number {
   return -1;
 }
 
-export function addUserMessage(t: Transcript, text: string): Transcript {
-  return { ...append(t, (id) => ({ id, kind: "user", text })), running: true };
+export function addUserMessage(t: Transcript, text: string, replyModel = ""): Transcript {
+  return {
+    ...append(t, (id) => ({ id, kind: "user", text, replyModel })),
+    running: true,
+    lastUserIndex: t.blocks.length,
+  };
+}
+
+export function labelActiveReply(t: Transcript, replyModel: string): Transcript {
+  const user = t.blocks[t.lastUserIndex];
+  return user?.kind === "user" && user.replyModel !== replyModel
+    ? replaceAt(t, t.lastUserIndex, { ...user, replyModel })
+    : t;
 }
 
 /** Folds one agent event into the transcript. Consecutive deltas of one kind extend the last block. */
@@ -112,7 +123,7 @@ export function applyEvent(t: Transcript, event: AgentEvent): Transcript {
 export function transcriptFromTurns(turns: TurnSnapshot[]): Transcript {
   let t = emptyTranscript;
   for (const turn of turns) {
-    t = addUserMessage(t, turn.input.text);
+    t = addUserMessage(t, turn.input.text, turn.model);
     // A turn without a turn.end is still running (or was interrupted); the live events decide.
     for (const event of turn.events) t = applyEvent(t, event);
   }

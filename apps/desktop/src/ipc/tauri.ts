@@ -15,6 +15,8 @@ export function createTauriIpc(): Ipc {
     createThread: (projectId, agent) =>
       invoke("create_thread", { projectId, agent }),
     loadThread: (threadId) => invoke("load_thread", { threadId }),
+    listThreadModels: (threadId) => invoke("list_thread_models", { threadId }),
+    setThreadModel: (threadId, modelId) => invoke("set_thread_model", { threadId, modelId }),
     sendMessage: (threadId, input) =>
       invoke("send_message", { threadId, input }),
     answerApproval: (threadId, approvalId, decision) =>

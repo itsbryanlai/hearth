@@ -12,6 +12,8 @@
     "allow-list-threads",
     "allow-create-thread",
     "allow-load-thread",
+    "allow-list-thread-models",
+    "allow-set-thread-model",
     "allow-send-message",
     "allow-answer-approval",
     "allow-cancel-turn",

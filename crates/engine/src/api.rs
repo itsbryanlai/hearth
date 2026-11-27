@@ -39,6 +39,22 @@ pub struct InstalledAgent {
     pub remembers_approvals: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelChoice {
+    pub id: String,
+    pub label: String,
+    pub resolved_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadModels {
+    pub choices: Vec<ModelChoice>,
+    pub selected: Option<String>,
+    pub current: Option<String>,
+}
+
 /// One user message and the agent events it produced, in order.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]

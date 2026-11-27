@@ -2,7 +2,7 @@ import type { AgentEvent, ApprovalDecision } from "@hearth/protocol";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { App } from "./App";
-import type { InstalledAgent, Ipc, ThreadEventPayload, ThreadSnapshot } from "./ipc/contract";
+import type { InstalledAgent, Ipc, ThreadEventPayload, ThreadModels, ThreadSnapshot } from "./ipc/contract";
 import { createMockIpc } from "./ipc/mock";
 import { createAppStore, nextFrame } from "./state/store";
 
@@ -58,6 +58,8 @@ function fakeIpc(snapshot: ThreadSnapshot = { thread: THREAD, turns: [], lastSeq
     listThreads: vi.fn(async () => [THREAD]),
     createThread: vi.fn(),
     loadThread: vi.fn(async () => snapshot),
+    listThreadModels: vi.fn(async (): Promise<ThreadModels> => ({ choices: [], selected: null, current: null })),
+    setThreadModel: vi.fn<Ipc["setThreadModel"]>(async () => THREAD),
     sendMessage: vi.fn(async () => THREAD),
     answerApproval: vi.fn(async () => {}),
     cancelTurn: vi.fn(async () => {}),
@@ -66,8 +68,8 @@ function fakeIpc(snapshot: ThreadSnapshot = { thread: THREAD, turns: [], lastSeq
       return () => {};
     },
   } satisfies Record<keyof Ipc, unknown>;
-  const send = (event: AgentEvent, seq = 1) =>
-    act(() => emit({ threadId: "th", turnId: "t1", seq, event }));
+  const send = (event: AgentEvent, seq = 1, model?: string) =>
+    act(() => emit({ threadId: "th", turnId: "t1", seq, event, model }));
   return { ipc: ipc as Ipc & typeof ipc, send };
 }
 
@@ -79,6 +81,87 @@ async function openThread(ipc: Ipc, f = frames()) {
   await vi.waitFor(() => expect((screen.getByLabelText("Message") as HTMLTextAreaElement).disabled).toBe(false));
   return { store, f };
 }
+
+// Fails if rejection leaves a stale catalog, a change loses an alias or relabels old replies,
+// or Send is enabled before the new selection is ready.
+test("model changes keep historical labels and accept only the acknowledged selection", async () => {
+  const { ipc, send } = fakeIpc({
+    thread: THREAD,
+    lastSeq: 2,
+    turns: [{
+      turnId: "prior",
+      agent: "claude-code",
+      model: "prior-model",
+      input: { kind: "text", text: "Earlier request" },
+      events: [
+        { kind: "text.delta", text: "Earlier reply" },
+        { kind: "turn.end", stopReason: "endTurn" },
+      ],
+    }],
+  });
+  ipc.listThreadModels.mockResolvedValue({
+    selected: null,
+    current: "opus",
+    choices: [
+      { id: "default", label: "Default", resolvedId: "opus" },
+      { id: "opus", label: "Opus", resolvedId: "opus" },
+      { id: "sonnet", label: "Sonnet", resolvedId: "sonnet" },
+    ],
+  });
+  const { f } = await openThread(ipc);
+  fireEvent.click(screen.getByRole("button", { name: "Choose model" }));
+  const picker = await screen.findByRole("combobox", { name: "Model" });
+
+  let refresh: () => void = () => {};
+  ipc.listThreadModels.mockImplementationOnce(() => new Promise((resolve) => {
+    refresh = () => resolve({
+      selected: null,
+      current: "haiku",
+      choices: [
+        { id: "default", label: "Default", resolvedId: "opus" },
+        { id: "opus", label: "Opus", resolvedId: "opus" },
+        { id: "haiku", label: "Haiku", resolvedId: "haiku" },
+      ],
+    });
+  }));
+  ipc.setThreadModel.mockRejectedValueOnce(new Error("The model change was rejected."));
+  fireEvent.change(picker, { target: { value: "sonnet" } });
+  expect((await screen.findByRole("alert")).textContent).toBe("The model change was rejected.");
+  expect(screen.getByRole("button", { name: "Send" }).hasAttribute("disabled")).toBe(true);
+  await act(async () => refresh());
+
+  expect(picker).toBeInstanceOf(HTMLSelectElement);
+  if (!(picker instanceof HTMLSelectElement)) throw new Error("Expected a model select");
+  expect(picker.value).toBe("opus");
+  expect(within(picker).queryByRole("option", { name: "Sonnet" })).toBeNull();
+  expect(within(picker).getByRole("option", { name: "Haiku" })).toBeDefined();
+
+  let acknowledge: () => void = () => {};
+  ipc.setThreadModel.mockImplementationOnce(() => new Promise((resolve) => {
+    acknowledge = () => resolve(THREAD);
+  }));
+  fireEvent.change(picker, { target: { value: "default" } });
+  expect(screen.getByRole("button", { name: "Send" }).hasAttribute("disabled")).toBe(true);
+  await act(async () => acknowledge());
+
+  expect(ipc.setThreadModel).toHaveBeenLastCalledWith("th", "default");
+  expect(picker.value).toBe("default");
+  expect(screen.getByText("Reply model: prior-model")).toBeDefined();
+  expect(screen.getByRole("button", { name: "Send" }).hasAttribute("disabled")).toBe(false);
+
+  let finishSend: () => void = () => {};
+  ipc.sendMessage.mockImplementationOnce(() => new Promise((resolve) => {
+    finishSend = () => resolve({ ...THREAD, title: "Updated thread title", model: "old-model" });
+  }));
+  fireEvent.change(screen.getByLabelText("Message"), { target: { value: "Another request" } });
+  fireEvent.click(screen.getByRole("button", { name: "Send" }));
+  await send({ kind: "text.delta", text: "Live reply" }, 3, "observed-model");
+  f.run();
+  await act(async () => finishSend());
+  expect(screen.getByRole("button", { name: "Updated thread title" })).toBeDefined();
+  expect(screen.getByText(/claude-code · observed-model/)).toBeDefined();
+  expect(screen.getByText("Reply model: observed-model")).toBeDefined();
+});
 
 // Fails if each delta is rendered on arrival, or if deltas become separate blocks.
 test("deltas arriving within one frame show as one merged block after the frame", async () => {

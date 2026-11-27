@@ -8,7 +8,7 @@ mod coalesce;
 mod engine;
 
 pub use api::{
-    AgentStatus, EngineError, EventSink, InstalledAgent, Project, ThreadEventPayload,
+    AgentStatus, EngineError, EventSink, InstalledAgent, Project, ThreadEventPayload, ThreadModels,
     ThreadSnapshot, ThreadSummary, TurnSnapshot,
 };
 pub use engine::{Engine, EngineConfig};

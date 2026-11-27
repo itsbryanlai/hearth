@@ -79,7 +79,12 @@ export function BlockView({
 }) {
   switch (block.kind) {
     case "user":
-      return <div className="block user">{block.text}</div>;
+      return (
+        <div className="block user">
+          {block.text}
+          {block.replyModel ? <div className="reply-model">Reply model: {block.replyModel}</div> : null}
+        </div>
+      );
     case "text":
       return <div className="block text">{block.text}</div>;
     case "reasoning":

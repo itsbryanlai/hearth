@@ -136,6 +136,8 @@ pub struct StoredEvent {
 #[derive(Debug, Clone, PartialEq)]
 pub struct LoadedTurn {
     pub turn: Turn,
+    pub agent: AgentId,
+    pub model: String,
     pub events: Vec<StoredEvent>,
 }
 
@@ -265,7 +267,7 @@ impl Store {
         self.get_thread(&id)
     }
 
-    fn get_thread(&self, id: &ThreadId) -> Result<Thread> {
+    pub fn get_thread(&self, id: &ThreadId) -> Result<Thread> {
         Ok(self
             .conn
             .query_row(THREAD_SELECT_BY_ID, [&id.0], thread_from_row)?)
@@ -377,17 +379,27 @@ impl Store {
     /// The thread with its turns (by `seq`) and each turn's events (by `seq`).
     pub fn load_thread(&self, id: &ThreadId) -> Result<LoadedThread> {
         let thread = self.get_thread(id)?;
-        let mut turn_stmt = self
-            .conn
-            .prepare(&format!("{TURN_SELECT} WHERE thread_id = ?1 ORDER BY seq"))?;
-        let turns: Vec<Turn> = turn_stmt
-            .query_map([&id.0], turn_from_row)?
+        let mut turn_stmt = self.conn.prepare(&format!(
+            "SELECT turn.*, session.agent_id, session.model
+             FROM ({TURN_SELECT} WHERE thread_id = ?1) turn
+             JOIN agent_sessions session ON session.id = turn.agent_session_id
+             ORDER BY turn.seq"
+        ))?;
+        let turns: Vec<_> = turn_stmt
+            .query_map([&id.0], |row| {
+                let agent: String = row.get(8)?;
+                Ok((
+                    turn_from_row(row)?,
+                    from_text::<AgentId>(&agent).map_err(json_err)?,
+                    row.get::<_, String>(9)?,
+                ))
+            })?
             .collect::<std::result::Result<_, _>>()?;
         let mut ev_stmt = self.conn.prepare(
             "SELECT id, seq, payload_json, raw_json FROM events WHERE turn_id = ?1 ORDER BY seq",
         )?;
         let mut loaded = Vec::with_capacity(turns.len());
-        for turn in turns {
+        for (turn, agent, model) in turns {
             let events = ev_stmt
                 .query_map([&turn.id.0], |r| {
                     let payload: String = r.get(2)?;
@@ -403,7 +415,12 @@ impl Store {
                     })
                 })?
                 .collect::<std::result::Result<_, _>>()?;
-            loaded.push(LoadedTurn { turn, events });
+            loaded.push(LoadedTurn {
+                turn,
+                agent,
+                model,
+                events,
+            });
         }
         Ok(LoadedThread {
             thread,
@@ -428,20 +445,91 @@ impl Store {
         Ok(())
     }
 
-    /// Fills in what is learned once the agent process is up.
-    pub fn update_agent_session(
+    pub fn selected_model(&self, thread: &ThreadId) -> Result<Option<String>> {
+        self.get_setting(&model_key(thread))?
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    /// Commits the chosen selector and the new turn-attribution row together.
+    pub fn select_model(
         &mut self,
-        id: &AgentSessionId,
+        thread: &ThreadId,
+        previous: &AgentSessionId,
+        choice: &str,
         model: &str,
-        external_session_id: &str,
+        external_id: Option<&str>,
     ) -> Result<()> {
-        let affected = self.conn.execute(
-            "UPDATE agent_sessions SET model = ?1, external_session_id = ?2 WHERE id = ?3",
-            params![model, external_session_id, id.0],
+        let tx = self.conn.transaction()?;
+        continue_session(&tx, previous, model, external_id)?;
+        put_setting(
+            &tx,
+            &model_key(thread),
+            &serde_json::Value::String(choice.into()),
         )?;
-        if affected == 0 {
-            return Err(rusqlite::Error::QueryReturnedNoRows.into());
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Records the ready model on the first turn, or starts another attribution row.
+    pub fn prepare_turn_session(
+        &mut self,
+        session: &AgentSession,
+        model: &str,
+        external_id: Option<&str>,
+    ) -> Result<AgentSessionId> {
+        if session.model == model && session.external_session_id.as_deref() == external_id {
+            return Ok(session.id.clone());
         }
+        if session.model.is_empty()
+            || (session.model == model && session.external_session_id.is_none())
+        {
+            write_session(&self.conn, &session.id, model, external_id)?;
+            Ok(session.id.clone())
+        } else {
+            continue_session(&self.conn, &session.id, model, external_id)
+        }
+    }
+
+    /// Attributes a turn to the model reported after it was started.
+    pub fn observe_turn_session(
+        &mut self,
+        turn: &Turn,
+        model: &str,
+        external_id: &str,
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        let (previous, previous_model, previous_external, shared): (String, String, Option<String>, bool) = tx.query_row(
+            "SELECT session.id, session.model, session.external_session_id, EXISTS(
+                SELECT 1 FROM turns older
+                WHERE older.agent_session_id = session.id AND older.role = 'assistant'
+                  AND older.seq < current.seq
+             ) FROM turns current JOIN agent_sessions session ON session.id = current.agent_session_id
+             WHERE current.id = ?1",
+            [&turn.id.0],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        let previous = AgentSessionId(previous);
+        if shared && (previous_model != model || previous_external.as_deref() != Some(external_id))
+        {
+            let session = continue_session(&tx, &previous, model, Some(external_id))?;
+            tx.execute(
+                "UPDATE turns SET agent_session_id = ?1
+                 WHERE thread_id = ?2 AND agent_session_id = ?3
+                   AND (id = ?4 OR (seq = ?5 AND role = 'user'))",
+                params![
+                    session.0,
+                    turn.thread_id.0,
+                    previous.0,
+                    turn.id.0,
+                    turn.seq - 1
+                ],
+            )?;
+        } else {
+            write_session(&tx, &previous, model, Some(external_id))?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -570,13 +658,58 @@ impl Store {
     }
 
     pub fn set_setting(&mut self, key: &str, value: &serde_json::Value) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO settings (key, value_json) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
-            params![key, value.to_string()],
-        )?;
-        Ok(())
+        put_setting(&self.conn, key, value)
     }
+}
+
+fn model_key(thread: &ThreadId) -> String {
+    format!("thread.{}.selectedModel", thread.0)
+}
+
+fn put_setting(conn: &Connection, key: &str, value: &serde_json::Value) -> Result<()> {
+    conn.execute(
+        "INSERT INTO settings (key, value_json) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
+        params![key, value.to_string()],
+    )?;
+    Ok(())
+}
+
+fn continue_session(
+    conn: &Connection,
+    previous: &AgentSessionId,
+    model: &str,
+    external_id: Option<&str>,
+) -> Result<AgentSessionId> {
+    let next = AgentSessionId::new();
+    let affected = conn.execute(
+        &format!(
+            "INSERT INTO agent_sessions (id, thread_id, agent_id, model, permission_mode, external_session_id, started_at)
+             SELECT ?1, thread_id, agent_id, ?2, permission_mode, ?3, {NOW_MS}
+             FROM agent_sessions WHERE id = ?4"
+        ),
+        params![next.0, model, external_id, previous.0],
+    )?;
+    if affected == 0 {
+        return Err(rusqlite::Error::QueryReturnedNoRows.into());
+    }
+    Ok(next)
+}
+
+fn write_session(
+    conn: &Connection,
+    id: &AgentSessionId,
+    model: &str,
+    external_id: Option<&str>,
+) -> Result<()> {
+    let affected = conn.execute(
+        "UPDATE agent_sessions SET model = ?1, external_session_id = ?2 WHERE id = ?3",
+        params![model, external_id, id.0],
+    )?;
+    if affected == 0 {
+        return Err(rusqlite::Error::QueryReturnedNoRows.into());
+    }
+    Ok(())
 }
 
 const THREAD_SELECT: &str = "SELECT id, project_id, title, cwd, worktree_path, branch, base_ref, status, created_at, archived_at FROM threads";

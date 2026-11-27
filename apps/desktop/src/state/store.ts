@@ -5,6 +5,7 @@ import type {
   Ipc,
   Project,
   ThreadEventPayload,
+  ThreadModels,
   ThreadSummary,
 } from "../ipc/contract";
 import {
@@ -12,21 +13,34 @@ import {
   answerApprovalBlock,
   applyEvent,
   emptyTranscript,
+  labelActiveReply,
   transcriptFromTurns,
   type Transcript,
 } from "./transcript";
+
+type ModelPickerState =
+  | { kind: "loading" }
+  | { kind: "failed"; message: string }
+  | { kind: "ready" | "switching"; models: ThreadModels };
+
+export function modelPickerBusy(state: ModelPickerState | undefined): boolean {
+  return state?.kind === "loading" || state?.kind === "switching";
+}
 
 export type AppState = {
   agents: InstalledAgent[];
   projects: Project[];
   threads: Record<string, ThreadSummary[]>;
   transcripts: Record<string, Transcript>;
+  modelPickers: Record<string, ModelPickerState>;
   activeThreadId: string | null;
   error: string | null;
   init(): Promise<void>;
   addProject(path: string): Promise<void>;
   createThread(projectId: string, agent?: AgentId): Promise<void>;
   selectThread(threadId: string): Promise<void>;
+  loadModels(threadId: string): Promise<void>;
+  setModel(threadId: string, modelId: string): Promise<void>;
   send(text: string): Promise<void>;
   answerApproval(approvalId: string, decision: ApprovalDecision): Promise<void>;
   cancel(): Promise<void>;
@@ -68,6 +82,7 @@ export function createAppStore(ipc: Ipc, options: Options = {}): AppStore {
   let frameScheduled = false;
   const loading = new Set<string>();
   const pendingAnswers = new Set<string>();
+  const pendingSends = new Map<string, { modelUpdated: boolean }>();
   let unsubscribe: (() => void) | undefined;
 
   return createStore<AppState>()((set, get) => {
@@ -76,6 +91,17 @@ export function createAppStore(ipc: Ipc, options: Options = {}): AppStore {
         transcripts: { ...s.transcripts, [threadId]: f(s.transcripts[threadId] ?? emptyTranscript) },
       }));
     const fail = (e: unknown) => set({ error: e instanceof Error ? e.message : String(e) });
+
+    const refreshModelChoices = async (threadId: string) => {
+      let picker: ModelPickerState;
+      try {
+        const models = await ipc.listThreadModels(threadId);
+        picker = { kind: "ready", models };
+      } catch (e) {
+        picker = { kind: "failed", message: e instanceof Error ? e.message : String(e) };
+      }
+      set((s) => ({ modelPickers: { ...s.modelPickers, [threadId]: picker } }));
+    };
 
     const flush = () => {
       frameScheduled = false;
@@ -87,9 +113,16 @@ export function createAppStore(ipc: Ipc, options: Options = {}): AppStore {
         let models: Map<string, string> | undefined;
         for (const p of batch) {
           // Events for a thread that is not loaded yet are covered by its snapshot.
-          if (p.model !== undefined) (models ??= new Map()).set(p.threadId, p.model);
+          if (p.model !== undefined) {
+            (models ??= new Map()).set(p.threadId, p.model);
+            const pending = pendingSends.get(p.threadId);
+            if (pending) pending.modelUpdated = true;
+          }
           const t = transcripts[p.threadId];
-          if (t) transcripts[p.threadId] = applyEvent(t, p.event);
+          if (t) {
+            const labeled = p.model === undefined ? t : labelActiveReply(t, p.model);
+            transcripts[p.threadId] = applyEvent(labeled, p.event);
+          }
         }
         const updatedModels = models;
         if (!updatedModels) return { transcripts };
@@ -119,6 +152,7 @@ export function createAppStore(ipc: Ipc, options: Options = {}): AppStore {
       projects: [],
       threads: {},
       transcripts: {},
+      modelPickers: {},
       activeThreadId: null,
       error: null,
       flush,
@@ -187,27 +221,68 @@ export function createAppStore(ipc: Ipc, options: Options = {}): AppStore {
           loading.delete(threadId);
         }
       },
+      async loadModels(threadId) {
+        const state = get();
+        if (state.transcripts[threadId]?.running || modelPickerBusy(state.modelPickers[threadId])) return;
+        set((s) => ({ modelPickers: { ...s.modelPickers, [threadId]: { kind: "loading" } } }));
+        await refreshModelChoices(threadId);
+      },
+      async setModel(threadId, modelId) {
+        const state = get();
+        const picker = state.modelPickers[threadId];
+        if (picker?.kind !== "ready" || state.transcripts[threadId]?.running) return;
+        const { models } = picker;
+        set((s) => ({
+          error: null,
+          modelPickers: { ...s.modelPickers, [threadId]: { kind: "switching", models } },
+        }));
+        try {
+          const summary = await ipc.setThreadModel(threadId, modelId);
+          const pending = pendingSends.get(threadId);
+          if (pending) pending.modelUpdated = true;
+          set((s) => ({
+            modelPickers: {
+              ...s.modelPickers,
+              [threadId]: { kind: "ready", models: { ...models, selected: modelId } },
+            },
+            threads: {
+              ...s.threads,
+              [summary.projectId]: (s.threads[summary.projectId] ?? []).map(
+                (thread) => (thread.id === summary.id ? summary : thread),
+              ),
+            },
+          }));
+        } catch (e) {
+          fail(e);
+          await refreshModelChoices(threadId);
+        }
+      },
       async send(text) {
         const threadId = get().activeThreadId;
         const body = text.trim();
-        if (!threadId || body === "" || get().transcripts[threadId]?.running) return;
+        if (!threadId || body === "" || get().transcripts[threadId]?.running || modelPickerBusy(get().modelPickers[threadId])) return;
+        const pending = { modelUpdated: false };
+        pendingSends.set(threadId, pending);
         setTranscript(threadId, (t) => addUserMessage(t, body));
         try {
           const summary = await ipc.sendMessage(threadId, { kind: "text", text: body });
-          // The agent's model and the title are known only now.
+          if (pendingSends.get(threadId) !== pending) return;
           set((s) => ({
             threads: Object.fromEntries(
               Object.entries(s.threads).map(([project, list]) => [
                 project,
                 list.map((t) =>
-                  t.id === summary.id ? { ...summary, model: summary.model || t.model } : t,
+                  t.id === summary.id ? { ...summary, model: pending.modelUpdated ? t.model : summary.model || t.model } : t,
                 ),
               ]),
             ),
           }));
         } catch (e) {
+          if (pendingSends.get(threadId) !== pending) return;
           setTranscript(threadId, (t) => ({ ...t, running: false }));
           fail(e);
+        } finally {
+          if (pendingSends.get(threadId) === pending) pendingSends.delete(threadId);
         }
       },
       async answerApproval(approvalId, decision) {

@@ -3,7 +3,7 @@
 pub mod claude;
 pub mod qwen;
 
-use crate::api::AgentStatus;
+use crate::api::{AgentStatus, ModelChoice};
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -71,6 +71,17 @@ pub trait AgentAdapter: Send + Sync {
 
 pub trait AgentSession: Send + Sync {
     fn prompt(&self, input: UserInput) -> AgentFuture<'_, Result<Box<dyn AgentStream>, String>>;
+
+    fn models(&self) -> &[ModelChoice] {
+        &[]
+    }
+
+    fn set_model<'a>(
+        &'a self,
+        _choice: &'a ModelChoice,
+    ) -> AgentFuture<'a, Result<String, String>> {
+        Box::pin(async { Err("This agent does not support changing models.".into()) })
+    }
 
     fn reopen_after_forced_end(&self) -> bool {
         false

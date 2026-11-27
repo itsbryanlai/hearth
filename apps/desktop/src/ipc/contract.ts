@@ -31,6 +31,10 @@ export type ThreadSummary = {
   model: string;
 };
 
+export type ModelChoice = { id: string; label: string; resolvedId: string | null };
+
+export type ThreadModels = { choices: ModelChoice[]; selected: string | null; current: string | null };
+
 /** One user message and the agent events it produced, in order. */
 export type TurnSnapshot = {
   turnId: TurnId;
@@ -69,6 +73,8 @@ export interface Ipc {
   listThreads(projectId: ProjectId): Promise<ThreadSummary[]>;
   createThread(projectId: ProjectId, agent: AgentId): Promise<ThreadSummary>;
   loadThread(threadId: ThreadId): Promise<ThreadSnapshot>;
+  listThreadModels(threadId: ThreadId): Promise<ThreadModels>;
+  setThreadModel(threadId: ThreadId, modelId: string): Promise<ThreadSummary>;
   /** Resolves with the thread as it is once the turn started (title, model). */
   sendMessage(threadId: ThreadId, input: UserInput): Promise<ThreadSummary>;
   answerApproval(
