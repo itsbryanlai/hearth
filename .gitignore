@@ -5,3 +5,5 @@ target/
 *.log
 .env
 .env.*
+apps/desktop/src-tauri/gen/
+coverage/
