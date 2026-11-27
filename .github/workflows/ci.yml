@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gates:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Mirrors the local gates (AGENTS.md "Verification"). The local-only check that keeps one
+      # product name out of tracked files is deliberately not ported, because
+      # its pattern would put that name in a tracked file.
+      - name: git diff --check
+        if: github.event_name == 'pull_request'
+        run: git diff --check "origin/${{ github.base_ref }}...HEAD"
+
+      - name: bash -n on tracked shell scripts
+        run: git ls-files -z '*.sh' | xargs -0 -n1 bash -n
+
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        # Version comes from "packageManager" in package.json.
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        run: |
+          rustup toolchain install
+          rustc --version
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm -r --if-present lint
+      - run: pnpm -r --if-present typecheck
+      - run: pnpm -r --if-present test
+
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+      - run: scripts/privacy-gates.sh
+      - run: bash scripts/tests/test-privacy-gates.sh
