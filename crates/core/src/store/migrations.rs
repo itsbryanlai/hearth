@@ -70,4 +70,6 @@ pub(super) const MIGRATIONS: &[&str] = &[
         value_json TEXT NOT NULL
     );
     ",
+    // 2: the user's message on a user turn (a UserInput as JSON).
+    "ALTER TABLE turns ADD COLUMN input_json TEXT;",
 ];
