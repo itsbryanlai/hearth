@@ -1732,3 +1732,268 @@ async fn archive_refuses_a_running_turn() {
     assert!(engine.archive_thread(&thread).await.is_err());
     assert!(!engine.load_thread(&thread).unwrap().thread.archived);
 }
+
+// Fails if the draft loses user input, leaks private data, or changes its source.
+#[tokio::test]
+async fn handoff_draft_preserves_input_and_reports_observed_events_without_mutation() {
+    use hearth_core::store::{NewEvent, Store};
+    use hearth_protocol::FileEditKind;
+
+    let w = world();
+    let (engine, mut rx) = engine_both(&w, fixture("acp-approval-allowed.jsonl"));
+    let thread = thread_of(&engine, &w).await;
+    let empty = engine
+        .draft_handoff(&thread, AgentId::ClaudeCode)
+        .await
+        .unwrap();
+    assert!(empty.text.contains("No conversation recorded."));
+    let input = "First line\nKeep every detail, including this one.";
+    engine.send_message(&thread, say(input)).await.unwrap();
+    let approval = until(&mut rx, is_approval).await;
+    let AgentEvent::ApprovalRequest { request } = &approval.last().unwrap().event else {
+        unreachable!()
+    };
+    engine
+        .answer_approval(&thread, &request.id, ApprovalDecision::AllowOnce)
+        .await
+        .unwrap();
+    until(&mut rx, is_end).await;
+    let turn = engine.load_thread(&thread).unwrap().turns[0]
+        .turn_id
+        .clone();
+    let mut store = Store::open(&w.db).unwrap();
+    let events = vec![
+        AgentEvent::ReasoningDelta {
+            text: "private thought marker".into(),
+        },
+        AgentEvent::FileEdit {
+            tool_call_id: "edit".into(),
+            path: "src/example.rs".into(),
+            edit_kind: FileEditKind::Modify,
+        },
+        AgentEvent::CommandRun {
+            tool_call_id: "command".into(),
+            command: "cargo test".into(),
+            exit_code: Some(1),
+        },
+        AgentEvent::CommandRun {
+            tool_call_id: "pending".into(),
+            command: "cargo check".into(),
+            exit_code: None,
+        },
+    ];
+    store
+        .append_events(
+            &turn,
+            &events
+                .into_iter()
+                .map(|event| NewEvent {
+                    event,
+                    raw: Some(serde_json::json!({"secret": "raw wire marker"})),
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    let before = engine.load_thread(&thread).unwrap();
+    let sessions_before = store.latest_agent_session(&thread).unwrap().unwrap().id;
+    let threads_before = engine.list_threads(&before.thread.project_id).unwrap();
+    let drafted = engine
+        .draft_handoff(&thread, AgentId::ClaudeCode)
+        .await
+        .unwrap();
+    assert_eq!(drafted.thread_id, thread);
+    assert_eq!(drafted.source_agent, AgentId::QwenCode);
+    assert_eq!(drafted.target_agent, AgentId::ClaudeCode);
+    let draft = drafted.text;
+    assert!(draft.contains(input));
+    assert!(draft.contains("done — appended"));
+    assert!(draft.contains("src/example.rs"));
+    assert!(draft.contains("cargo test (exit code 1)"));
+    assert!(draft.contains("cargo check (exit status not recorded)"));
+    assert!(!draft.contains("private thought marker"));
+    assert!(!draft.contains("raw wire marker"));
+    assert_eq!(engine.load_thread(&thread).unwrap(), before);
+    assert_eq!(
+        engine.list_threads(&before.thread.project_id).unwrap(),
+        threads_before
+    );
+    assert_eq!(
+        store.latest_agent_session(&thread).unwrap().unwrap().id,
+        sessions_before
+    );
+}
+
+fn engine_both(w: &World, qwen: PathBuf) -> (Engine, mpsc::UnboundedReceiver<ThreadEventPayload>) {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/claude");
+    let (tx, rx) = mpsc::unbounded_channel();
+    let engine = Engine::new(
+        EngineConfig {
+            db_path: Some(w.db.clone()),
+            home: w.home.clone(),
+            roots: vec![],
+            agents: vec![
+                Registration {
+                    id: AgentId::QwenCode,
+                    label: "Qwen Code",
+                    adapter: Arc::new(QwenAdapter(Arc::new(ReplayLauncher(qwen)))),
+                },
+                Registration {
+                    id: AgentId::ClaudeCode,
+                    label: "Claude Code",
+                    adapter: Arc::new(claude_adapter(
+                        w,
+                        "simple",
+                        &fixtures.join("simple.jsonl"),
+                        None,
+                    )),
+                },
+            ],
+        },
+        Arc::new(ChannelSink(tx)),
+    )
+    .unwrap();
+    (engine, rx)
+}
+
+/// Runs one approved Qwen turn so a thread has source history.
+async fn finish_qwen_turn(
+    engine: &Engine,
+    rx: &mut mpsc::UnboundedReceiver<ThreadEventPayload>,
+    thread: &ThreadId,
+    text: &str,
+) {
+    engine.send_message(thread, say(text)).await.unwrap();
+    let approval = until(rx, is_approval).await;
+    let AgentEvent::ApprovalRequest { request } = &approval.last().unwrap().event else {
+        unreachable!()
+    };
+    engine
+        .answer_approval(thread, &request.id, ApprovalDecision::AllowOnce)
+        .await
+        .unwrap();
+    until(rx, is_end).await;
+}
+
+// Fails if a draft starts a session or ignores the worktree's changed files.
+#[tokio::test]
+async fn handoff_draft_lists_worktree_changes_without_starting_a_session() {
+    let w = world();
+    init_git(&w);
+    let (engine, _rx) = engine_both(&w, fixture("acp-cancel.jsonl"));
+    let project = engine.add_project(w.project.to_str().unwrap()).unwrap();
+    let thread = engine
+        .create_thread_in(&project.id, AgentId::QwenCode, Some("HEAD".into()))
+        .await
+        .unwrap();
+    let store = hearth_core::store::Store::open(&w.db).unwrap();
+    let saved = store.get_thread(&thread.id).unwrap();
+    std::fs::write(Path::new(&saved.cwd).join("tracked"), "changed\n").unwrap();
+    let session = store.latest_agent_session(&thread.id).unwrap().unwrap().id;
+
+    let draft = engine
+        .draft_handoff(&thread.id, AgentId::ClaudeCode)
+        .await
+        .unwrap();
+    assert!(draft.text.contains("tracked"), "{}", draft.text);
+    assert_eq!(
+        store.latest_agent_session(&thread.id).unwrap().unwrap().id,
+        session
+    );
+}
+
+// Fails if hand-off loses source turns or does not switch the thread's agent.
+#[tokio::test]
+async fn handoff_switches_the_thread_agent_and_keeps_source_turns() {
+    let w = world();
+    let (engine, mut rx) = engine_both(&w, fixture("acp-approval-allowed.jsonl"));
+    let thread = thread_of(&engine, &w).await;
+    finish_qwen_turn(&engine, &mut rx, &thread, "source request").await;
+    let cwd = hearth_core::store::Store::open(&w.db)
+        .unwrap()
+        .get_thread(&thread)
+        .unwrap()
+        .cwd;
+
+    let summary = engine
+        .start_handoff(&thread, AgentId::ClaudeCode, "edited preamble".into())
+        .await
+        .unwrap();
+    assert_eq!(summary.agent, AgentId::ClaudeCode);
+    until(&mut rx, is_end).await;
+
+    let snap = engine.load_thread(&thread).unwrap();
+    assert_eq!(snap.turns.len(), 2);
+    assert_eq!(snap.turns[0].input, say("source request"));
+    assert_eq!(snap.turns[0].agent, AgentId::QwenCode);
+    assert_eq!(snap.turns[1].input, say("edited preamble"));
+    assert_eq!(snap.turns[1].agent, AgentId::ClaudeCode);
+    drop(engine);
+    let (reopened, _rx) = engine_both(&w, fixture("acp-approval-allowed.jsonl"));
+    assert_eq!(
+        reopened.load_thread(&thread).unwrap().thread.agent,
+        AgentId::ClaudeCode
+    );
+    let after = hearth_core::store::Store::open(&w.db)
+        .unwrap()
+        .get_thread(&thread)
+        .unwrap();
+    assert_eq!(after.cwd, cwd);
+}
+
+// Fails if hand-off starts when it must refuse.
+#[tokio::test]
+async fn handoff_refuses_invalid_requests() {
+    #[derive(Clone, Copy, Debug)]
+    enum Case {
+        SameAgent,
+        Archived,
+        Empty,
+        TurnAwaitingApproval,
+    }
+    for case in [
+        Case::SameAgent,
+        Case::Archived,
+        Case::Empty,
+        Case::TurnAwaitingApproval,
+    ] {
+        let w = world();
+        let (engine, mut rx) = engine_both(&w, fixture("acp-approval-allowed.jsonl"));
+        let thread = thread_of(&engine, &w).await;
+        let (target, text) = match case {
+            Case::SameAgent => (AgentId::QwenCode, "text"),
+            Case::Empty => (AgentId::ClaudeCode, "  "),
+            _ => (AgentId::ClaudeCode, "text"),
+        };
+        match case {
+            Case::Archived => {
+                hearth_core::store::Store::open(&w.db)
+                    .unwrap()
+                    .update_thread_status(&thread, hearth_core::store::ThreadStatus::Archived)
+                    .unwrap();
+            }
+            Case::TurnAwaitingApproval => {
+                engine.send_message(&thread, say("go")).await.unwrap();
+                until(&mut rx, is_approval).await;
+            }
+            _ => {}
+        }
+        let before = hearth_core::store::Store::open(&w.db)
+            .unwrap()
+            .latest_agent_session(&thread)
+            .unwrap()
+            .unwrap();
+        assert!(
+            engine
+                .start_handoff(&thread, target, text.into())
+                .await
+                .is_err(),
+            "{case:?}"
+        );
+        let after = hearth_core::store::Store::open(&w.db)
+            .unwrap()
+            .latest_agent_session(&thread)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.id, before.id, "{case:?}");
+    }
+}

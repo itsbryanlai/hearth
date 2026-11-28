@@ -24,6 +24,8 @@
     "allow-restore-thread",
     "allow-list-thread-models",
     "allow-set-thread-model",
+    "allow-draft-handoff",
+    "allow-start-handoff",
     "allow-send-message",
     "allow-answer-approval",
     "allow-cancel-turn",

@@ -27,6 +27,8 @@ export function createTauriIpc(): Ipc {
     restoreThread: (threadId) => invoke("restore_thread", { threadId }),
     listThreadModels: (threadId) => invoke("list_thread_models", { threadId }),
     setThreadModel: (threadId, modelId) => invoke("set_thread_model", { threadId, modelId }),
+    draftHandoff: (threadId, target) => invoke("draft_handoff", { threadId, target }),
+    startHandoff: (threadId, target, text) => invoke("start_handoff", { threadId, target, text }),
     sendMessage: (threadId, input) =>
       invoke("send_message", { threadId, input }),
     answerApproval: (threadId, approvalId, decision) =>

@@ -43,6 +43,7 @@ export type AppState = {
   releaseWorktreeReview: Ipc["releaseWorktreeReview"];
   turnDiffFiles: Ipc["turnDiffFiles"];
   turnDiffFile: Ipc["turnDiffFile"];
+  draftHandoff: Ipc["draftHandoff"];
   init(): Promise<void>;
   addProject(path: string): Promise<void>;
   worktreeInfo(projectId: string): Promise<{ isGit: boolean; base: string | null; reason: string | null }>;
@@ -52,6 +53,8 @@ export type AppState = {
   loadModels(threadId: string): Promise<void>;
   setModel(threadId: string, modelId: string): Promise<void>;
   send(text: string): Promise<void>;
+  /** Switches the active thread to `target` with the edited preamble; true once started. */
+  startHandoff(target: AgentId, text: string): Promise<boolean>;
   answerApproval(approvalId: string, decision: ApprovalDecision): Promise<void>;
   cancel(): Promise<void>;
   /** Applies every buffered event now. The frame callback calls this; tests may too. */
@@ -213,6 +216,7 @@ export function createAppStore(ipc: Ipc, options: Options = {}): AppStore {
       releaseWorktreeReview: (threadId, reviewId) => ipc.releaseWorktreeReview(threadId, reviewId),
       turnDiffFiles: (threadId, turnId) => ipc.turnDiffFiles(threadId, turnId),
       turnDiffFile: (threadId, turnId, fileId) => ipc.turnDiffFile(threadId, turnId, fileId),
+      draftHandoff: (threadId, target) => ipc.draftHandoff(threadId, target),
       worktreeInfo: (projectId) => ipc.worktreeInfo(projectId),
       async createThread(projectId, agent, base, parent) {
         try {
@@ -324,6 +328,31 @@ export function createAppStore(ipc: Ipc, options: Options = {}): AppStore {
           fail(e);
         } finally {
           if (pendingSends.get(threadId) === pending) pendingSends.delete(threadId);
+        }
+      },
+      async startHandoff(target, text) {
+        const threadId = get().activeThreadId;
+        const body = text.trim();
+        if (!threadId || get().archivePending[threadId] || Object.values(get().threads).flat().find((t) => t.id === threadId)?.archived || body === "" || get().transcripts[threadId]?.running || modelPickerBusy(get().modelPickers[threadId])) return false;
+        setTranscript(threadId, (t) => addUserMessage(t, body));
+        try {
+          const summary = await ipc.startHandoff(threadId, target, body);
+          set((s) => {
+            const modelPickers = { ...s.modelPickers };
+            delete modelPickers[threadId];
+            return {
+              modelPickers,
+              threads: {
+                ...s.threads,
+                [summary.projectId]: (s.threads[summary.projectId] ?? []).map((t) => (t.id === summary.id ? summary : t)),
+              },
+            };
+          });
+          return true;
+        } catch (e) {
+          setTranscript(threadId, (t) => ({ ...t, running: false }));
+          fail(e);
+          return false;
         }
       },
       async answerApproval(approvalId, decision) {

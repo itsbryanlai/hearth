@@ -20,6 +20,8 @@ fn main() {
             "restore_thread",
             "list_thread_models",
             "set_thread_model",
+            "draft_handoff",
+            "start_handoff",
             "send_message",
             "answer_approval",
             "cancel_turn",
