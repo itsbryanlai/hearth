@@ -6,7 +6,7 @@ import type { InstalledAgent, Ipc, ThreadEventPayload, ThreadModels, ThreadSnaps
 import { createMockIpc } from "./ipc/mock";
 import { createAppStore, nextFrame } from "./state/store";
 
-const THREAD = { id: "th", projectId: "p", title: "Thread one", agent: "claude-code", model: "opus", branch: null };
+const THREAD = { id: "th", projectId: "p", title: "Thread one", agent: "claude-code", model: "opus", branch: null, archived: false };
 
 beforeEach(() => {
   // jsdom has no layout: give every element a size so the virtualizer has a viewport.
@@ -66,6 +66,8 @@ function fakeIpc(snapshot: ThreadSnapshot = { thread: THREAD, turns: [], lastSeq
     releaseWorktreeReview: vi.fn<Ipc["releaseWorktreeReview"]>(async () => {}),
     turnDiffFiles: vi.fn<Ipc["turnDiffFiles"]>(async () => null),
     turnDiffFile: vi.fn<Ipc["turnDiffFile"]>(async () => null),
+    archiveThread: vi.fn(async () => ({ ...THREAD, archived: true })),
+    restoreThread: vi.fn(async () => THREAD),
     listThreadModels: vi.fn(async (): Promise<ThreadModels> => ({ choices: [], selected: null, current: null })),
     setThreadModel: vi.fn<Ipc["setThreadModel"]>(async () => THREAD),
     sendMessage: vi.fn(async () => THREAD),
@@ -497,4 +499,41 @@ test("releases a late worktree reservation after closing changes", async () => {
   expect(ipc.startWorktreeReview).toHaveBeenCalledTimes(2);
   expect(ipc.worktreeDiffFiles).toHaveBeenCalledOnce();
   expect(ipc.worktreeDiffFiles).toHaveBeenCalledWith("th", "review");
+});
+
+// Fails if archived history disappears or allows sending before it is restored.
+test("archive hides a thread while keeping its history available for restore", async () => {
+  const ipc = createMockIpc();
+  const store = createAppStore(ipc);
+  render(<App store={store} />);
+  fireEvent.click(await screen.findByRole("button", { name: "Fix flaky auth test" }));
+  await screen.findByText("It is a timing race in the session refresh.");
+  fireEvent.click(screen.getByRole("button", { name: "Archive" }));
+  await vi.waitFor(() => expect((screen.getByLabelText("Message") as HTMLTextAreaElement).disabled).toBe(true));
+  expect(screen.queryByRole("button", { name: "Fix flaky auth test (archived)" })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Show archived" }));
+  expect(screen.getByRole("button", { name: "Fix flaky auth test (archived)" })).toBeTruthy();
+  expect(screen.getByText("It is a timing race in the session refresh.")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Restore" }));
+  await vi.waitFor(() => expect((screen.getByLabelText("Message") as HTMLTextAreaElement).disabled).toBe(false));
+});
+
+// Fails if pending archive accepts a message or a late history load revives the thread.
+test("pending archive blocks sending and survives a late thread load", async () => {
+  const { ipc } = fakeIpc();
+  let finishLoad: (snapshot: ThreadSnapshot) => void = () => {};
+  let finishArchive: (thread: typeof THREAD) => void = () => {};
+  ipc.loadThread.mockImplementation(() => new Promise((resolve) => { finishLoad = resolve; }));
+  ipc.archiveThread.mockImplementation(() => new Promise((resolve) => { finishArchive = resolve; }));
+  const store = createAppStore(ipc);
+  render(<App store={store} />);
+  fireEvent.click(await screen.findByRole("button", { name: "Thread one" }));
+  fireEvent.click(screen.getByRole("button", { name: "Archive" }));
+  expect((screen.getByLabelText("Message") as HTMLTextAreaElement).disabled).toBe(true);
+  await act(async () => { await store.getState().send("must not appear"); });
+  expect(ipc.sendMessage).not.toHaveBeenCalled();
+  await act(async () => { finishArchive({ ...THREAD, archived: true }); });
+  await act(async () => { finishLoad({ thread: THREAD, turns: [], lastSeq: 0 }); });
+  expect(screen.getByRole("button", { name: "Restore" })).toBeTruthy();
+  expect((screen.getByLabelText("Message") as HTMLTextAreaElement).disabled).toBe(true);
 });

@@ -57,6 +57,8 @@ export function ThreadView() {
   );
   const running = useApp((s) => (s.activeThreadId ? (s.transcripts[s.activeThreadId]?.running ?? false) : false));
   const error = useApp((s) => s.error);
+  const archivePending = useApp((s) => threadId !== null && !!s.archivePending[threadId]);
+  const setArchived = useApp((s) => s.setArchived);
   const remembersApprovals = useApp((s) => s.agents.some((agent) =>
     agent.id === thread?.agent && agent.remembersApprovals,
   ));
@@ -70,9 +72,10 @@ export function ThreadView() {
             {thread.agent} · {thread.model}
           </span>
         ) : null}
-        {thread ? <ModelPicker thread={thread} running={running} /> : null}
+        {thread ? <ModelPicker thread={thread} running={running || thread.archived || archivePending} /> : null}
         {thread ? <button onClick={() => setChangesOpen((open) => !open)}>Changes</button> : null}
-        {thread ? <span className="muted">{running ? "running" : "idle"}</span> : null}
+        {thread ? <button type="button" disabled={running || archivePending} onClick={() => void setArchived(thread.id, !thread.archived)}>{thread.archived ? "Restore" : "Archive"}</button> : null}
+        {thread ? <span className="muted">{thread.archived ? "archived" : running ? "running" : "idle"}</span> : null}
       </header>
       {error ? (
         <div className="banner" role="alert">

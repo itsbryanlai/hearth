@@ -16,6 +16,8 @@ fn main() {
             "release_worktree_review",
             "turn_diff_files",
             "turn_diff_file",
+            "archive_thread",
+            "restore_thread",
             "list_thread_models",
             "set_thread_model",
             "send_message",

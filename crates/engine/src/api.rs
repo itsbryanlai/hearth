@@ -21,6 +21,7 @@ pub struct ThreadSummary {
     pub agent: AgentId,
     pub model: String,
     pub branch: Option<String>,
+    pub archived: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

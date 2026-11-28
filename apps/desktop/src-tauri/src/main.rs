@@ -152,6 +152,19 @@ async fn release_worktree_review(
 }
 
 #[tauri::command]
+async fn archive_thread(
+    engine: State<'_, Engine>,
+    thread_id: ThreadId,
+) -> Result<ThreadSummary, String> {
+    engine.archive_thread(&thread_id).await.map_err(show)
+}
+
+#[tauri::command]
+fn restore_thread(engine: State<'_, Engine>, thread_id: ThreadId) -> Result<ThreadSummary, String> {
+    engine.restore_thread(&thread_id).map_err(show)
+}
+
+#[tauri::command]
 async fn list_thread_models(
     engine: State<'_, Engine>,
     thread_id: ThreadId,
@@ -292,6 +305,8 @@ fn main() {
             release_worktree_review,
             turn_diff_files,
             turn_diff_file,
+            archive_thread,
+            restore_thread,
             list_thread_models,
             set_thread_model,
             send_message,

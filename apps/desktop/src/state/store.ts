@@ -33,6 +33,7 @@ export type AppState = {
   threads: Record<string, ThreadSummary[]>;
   transcripts: Record<string, Transcript>;
   modelPickers: Record<string, ModelPickerState>;
+  archivePending: Record<string, boolean>;
   activeThreadId: string | null;
   error: string | null;
   reviewTurns: Ipc["reviewTurns"];
@@ -47,6 +48,7 @@ export type AppState = {
   worktreeInfo(projectId: string): Promise<{ isGit: boolean; base: string | null; reason: string | null }>;
   createThread(projectId: string, agent: AgentId, base: string | null, parent?: string | null): Promise<string | null>;
   selectThread(threadId: string): Promise<void>;
+  setArchived(threadId: string, archived: boolean): Promise<void>;
   loadModels(threadId: string): Promise<void>;
   setModel(threadId: string, modelId: string): Promise<void>;
   send(text: string): Promise<void>;
@@ -89,6 +91,7 @@ export function createAppStore(ipc: Ipc, options: Options = {}): AppStore {
   const loading = new Set<string>();
   const reviewStarts = new Map<string, Promise<void>>();
   const pendingAnswers = new Set<string>();
+  const archiveVersions = new Map<string, number>();
   const pendingSends = new Map<string, { modelUpdated: boolean }>();
   let unsubscribe: (() => void) | undefined;
 
@@ -158,6 +161,7 @@ export function createAppStore(ipc: Ipc, options: Options = {}): AppStore {
       agents: [],
       projects: [],
       threads: {},
+      archivePending: {},
       transcripts: {},
       modelPickers: {},
       activeThreadId: null,
@@ -227,6 +231,7 @@ export function createAppStore(ipc: Ipc, options: Options = {}): AppStore {
         set({ activeThreadId: threadId });
         if (get().transcripts[threadId] || loading.has(threadId)) return;
         loading.add(threadId);
+        const archiveVersion = archiveVersions.get(threadId);
         try {
           const snapshot = await ipc.loadThread(threadId);
           // Events that arrived while loading are already in the snapshot.
@@ -236,7 +241,7 @@ export function createAppStore(ipc: Ipc, options: Options = {}): AppStore {
             threads: {
               ...s.threads,
               [snapshot.thread.projectId]: (s.threads[snapshot.thread.projectId] ?? []).map(
-                (thread) => thread.id === threadId ? snapshot.thread : thread,
+                (thread) => thread.id === threadId ? { ...snapshot.thread, archived: archiveVersions.get(threadId) === archiveVersion ? snapshot.thread.archived : thread.archived } : thread,
               ),
             },
           }));
@@ -245,6 +250,17 @@ export function createAppStore(ipc: Ipc, options: Options = {}): AppStore {
         } finally {
           loading.delete(threadId);
         }
+      },
+      async setArchived(threadId, archived) {
+        if (get().archivePending[threadId]) return;
+        archiveVersions.set(threadId, (archiveVersions.get(threadId) ?? 0) + 1);
+        set((s) => ({ archivePending: { ...s.archivePending, [threadId]: true } }));
+        try {
+          const summary = await (archived ? ipc.archiveThread(threadId) : ipc.restoreThread(threadId));
+          archiveVersions.set(threadId, (archiveVersions.get(threadId) ?? 0) + 1);
+          set((s) => ({ error: null, threads: { ...s.threads, [summary.projectId]: (s.threads[summary.projectId] ?? []).map((t) => t.id === summary.id ? summary : t) } }));
+        } catch (e) { fail(e); }
+        finally { set((s) => ({ archivePending: { ...s.archivePending, [threadId]: false } })); }
       },
       async loadModels(threadId) {
         const state = get();
@@ -285,7 +301,7 @@ export function createAppStore(ipc: Ipc, options: Options = {}): AppStore {
       async send(text) {
         const threadId = get().activeThreadId;
         const body = text.trim();
-        if (!threadId || body === "" || get().transcripts[threadId]?.running || modelPickerBusy(get().modelPickers[threadId])) return;
+        if (!threadId || get().archivePending[threadId] || Object.values(get().threads).flat().find((t) => t.id === threadId)?.archived || body === "" || get().transcripts[threadId]?.running || modelPickerBusy(get().modelPickers[threadId])) return;
         const pending = { modelUpdated: false };
         pendingSends.set(threadId, pending);
         setTranscript(threadId, (t) => addUserMessage(t, body));

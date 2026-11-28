@@ -75,8 +75,8 @@ export function createMockIpc(options: Options = {}): Ipc {
 
   const projects: Project[] = [{ id: "p1", name: "demo", path: "/work/demo" }];
   const threads: ThreadSummary[] = [
-    { id: "th1", projectId: "p1", title: "Fix flaky auth test", agent: "claude-code", model: "opus", branch: null },
-    { id: "th2", projectId: "p1", title: "Add retry to the sync job", agent: "qwen-code", model: "qwen3-coder", branch: null },
+    { id: "th1", projectId: "p1", title: "Fix flaky auth test", agent: "claude-code", model: "opus", branch: null, archived: false },
+    { id: "th2", projectId: "p1", title: "Add retry to the sync job", agent: "qwen-code", model: "qwen3-coder", branch: null, archived: false },
   ];
   const selections = new Map<string, string>();
   const turns = new Map<string, TurnSnapshot[]>([
@@ -149,6 +149,7 @@ export function createMockIpc(options: Options = {}): Ipc {
         agent,
         model: agent === "qwen-code" ? "qwen3-coder" : "opus",
         branch: null,
+        archived: false,
       };
       threads.push(thread);
       return thread;
@@ -169,6 +170,22 @@ export function createMockIpc(options: Options = {}): Ipc {
     releaseWorktreeReview: async () => {},
     turnDiffFiles: async () => null,
     turnDiffFile: async () => null,
+    async archiveThread(threadId) {
+      const index = threads.findIndex((t) => t.id === threadId);
+      const thread = threads[index];
+      if (!thread || running.has(threadId)) throw new Error("Thread unavailable.");
+      const updated = { ...thread, archived: true };
+      threads[index] = updated;
+      return updated;
+    },
+    async restoreThread(threadId) {
+      const index = threads.findIndex((t) => t.id === threadId);
+      const thread = threads[index];
+      if (!thread || running.has(threadId)) throw new Error("Thread unavailable.");
+      const updated = { ...thread, archived: false };
+      threads[index] = updated;
+      return updated;
+    },
     async listThreadModels(threadId) {
       const thread = threads.find((t) => t.id === threadId);
       if (!thread) throw new Error(`unknown thread ${threadId}`);
@@ -188,6 +205,7 @@ export function createMockIpc(options: Options = {}): Ipc {
     async sendMessage(threadId, input) {
       const thread = threads.find((t) => t.id === threadId);
       if (!thread) throw new Error(`unknown thread ${threadId}`);
+      if (thread.archived) throw new Error("Restore this thread before sending.");
       if (running.has(threadId)) throw new Error("a turn is already running");
       const turnId = id("turn");
       const list = turns.get(threadId) ?? [];

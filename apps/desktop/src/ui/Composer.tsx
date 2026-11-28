@@ -6,13 +6,15 @@ export function Composer() {
   const threadId = useApp((s) => s.activeThreadId);
   const running = useApp((s) => (s.activeThreadId ? (s.transcripts[s.activeThreadId]?.running ?? false) : false));
   const changingModel = useApp((s) => threadId !== null && modelPickerBusy(s.modelPickers[threadId]));
+  const archivePending = useApp((s) => threadId !== null && !!s.archivePending[threadId]);
+  const archived = useApp((s) => Object.values(s.threads).flat().find((t) => t.id === s.activeThreadId)?.archived ?? false);
   const send = useApp((s) => s.send);
   const cancel = useApp((s) => s.cancel);
   const [text, setText] = useState("");
-  const disabled = threadId === null;
+  const disabled = threadId === null || archived || archivePending;
 
   const submit = () => {
-    if (text.trim() === "" || running || changingModel) return;
+    if (disabled || text.trim() === "" || running || changingModel) return;
     void send(text);
     setText("");
   };
@@ -21,7 +23,7 @@ export function Composer() {
     <div className="composer">
       <textarea
         aria-label="Message"
-        placeholder={disabled ? "Select or create a thread" : "Message…  (⌘↵ to send, ⌘. to stop)"}
+        placeholder={archivePending ? "Updating thread…" : archived ? "Restore this thread to send a message" : disabled ? "Select or create a thread" : "Message…  (⌘↵ to send, ⌘. to stop)"}
         value={text}
         disabled={disabled}
         rows={3}

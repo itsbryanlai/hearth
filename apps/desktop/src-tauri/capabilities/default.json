@@ -20,6 +20,8 @@
     "allow-release-worktree-review",
     "allow-turn-diff-files",
     "allow-turn-diff-file",
+    "allow-archive-thread",
+    "allow-restore-thread",
     "allow-list-thread-models",
     "allow-set-thread-model",
     "allow-send-message",

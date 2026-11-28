@@ -30,6 +30,7 @@ export type ThreadSummary = {
   agent: AgentId;
   model: string;
   branch: string | null;
+  archived: boolean;
 };
 
 export type ModelChoice = { id: string; label: string; resolvedId: string | null };
@@ -88,6 +89,8 @@ export interface Ipc {
   releaseWorktreeReview(threadId: ThreadId, reviewId: string): Promise<void>;
   turnDiffFiles(threadId: ThreadId, turnId: TurnId): Promise<DiffFile[] | null>;
   turnDiffFile(threadId: ThreadId, turnId: TurnId, fileId: string): Promise<FileDiff | null>;
+  archiveThread(threadId: ThreadId): Promise<ThreadSummary>;
+  restoreThread(threadId: ThreadId): Promise<ThreadSummary>;
   listThreadModels(threadId: ThreadId): Promise<ThreadModels>;
   setThreadModel(threadId: ThreadId, modelId: string): Promise<ThreadSummary>;
   /** Resolves with the thread as it is once the turn started (title, model). */

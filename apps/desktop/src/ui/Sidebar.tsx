@@ -36,9 +36,11 @@ export function Sidebar() {
   const addProject = useApp((s) => s.addProject);
   const [adding, setAdding] = useState(false);
   const [path, setPath] = useState("");
+  const [showArchived, setShowArchived] = useState(false);
 
   return (
     <nav className="sidebar" aria-label="Projects">
+      <button type="button" className="quiet" aria-pressed={showArchived} onClick={() => setShowArchived(!showArchived)}>{showArchived ? "Hide archived" : "Show archived"}</button>
       {projects.map((p) => (
         <section key={p.id} className="project">
           <div className="project-head">
@@ -113,7 +115,7 @@ export function Sidebar() {
             </form>
           ) : null}
           <ul>
-            {(threads[p.id] ?? []).map((t) => (
+            {(threads[p.id] ?? []).filter((t) => showArchived || !t.archived).map((t) => (
               <li key={t.id}>
                 <button
                   type="button"
@@ -121,7 +123,7 @@ export function Sidebar() {
                   aria-current={t.id === active}
                   onClick={() => void select(t.id)}
                 >
-                  {t.title}{t.branch ? ` · ${t.branch}` : null}
+                  {t.title}{t.archived ? " (archived)" : ""}{t.branch ? ` · ${t.branch}` : null}
                 </button>
               </li>
             ))}
