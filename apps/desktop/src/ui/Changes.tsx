@@ -238,17 +238,29 @@ function FileChanges({ threadId, scope, fileId, path }: { threadId: string; scop
     if (diff.kind !== "ready" || !diff.value || diff.value.binary || typeof Worker === "undefined" || !diffLanguage(path)) return;
     const value = diff.value;
     let worker: Worker | undefined;
-    try {
-      worker = new Worker(new URL("./diffHighlight.worker.ts", import.meta.url), { type: "module" });
-      worker.onmessage = (event: MessageEvent<HighlightedHunk[] | null>) => {
-        if (event.data) setHighlighted({ diff: value, hunks: event.data });
-      };
-      worker.postMessage({ path, diff: value });
-    } catch {
-      worker?.terminate();
-      return;
-    }
-    return () => { worker.onmessage = null; worker.terminate(); };
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const frame = requestAnimationFrame(() => {
+      timer = setTimeout(() => {
+        try {
+          worker = new Worker(new URL("./diffHighlight.worker.ts", import.meta.url), { type: "module" });
+          worker.onmessage = (event: MessageEvent<HighlightedHunk[] | null>) => {
+            if (event.data) setHighlighted({ diff: value, hunks: event.data });
+          };
+          worker.postMessage({ path, diff: value });
+        } catch {
+          worker?.terminate();
+          worker = undefined;
+        }
+      }, 0);
+    });
+    return () => {
+      cancelAnimationFrame(frame);
+      if (timer !== undefined) clearTimeout(timer);
+      if (worker) {
+        worker.onmessage = null;
+        worker.terminate();
+      }
+    };
   }, [diff, path, threadId, scope.kind, scope.id, fileId]);
 
   const highlights = diff.kind === "ready" && highlighted?.diff === diff.value ? highlighted.hunks : undefined;
