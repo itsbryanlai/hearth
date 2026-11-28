@@ -50,6 +50,9 @@ export type AppState = {
   createThread(projectId: string, agent: AgentId, base: string | null, parent?: string | null): Promise<string | null>;
   selectThread(threadId: string): Promise<void>;
   setArchived(threadId: string, archived: boolean): Promise<void>;
+  cleanupPath(threadId: string): Promise<string | null>;
+  removeThreadWorktree(threadId: string): Promise<void>;
+  deleteThreadBranch(threadId: string): Promise<void>;
   loadModels(threadId: string): Promise<void>;
   setModel(threadId: string, modelId: string): Promise<void>;
   send(text: string): Promise<void>;
@@ -218,6 +221,9 @@ export function createAppStore(ipc: Ipc, options: Options = {}): AppStore {
       turnDiffFile: (threadId, turnId, fileId) => ipc.turnDiffFile(threadId, turnId, fileId),
       draftHandoff: (threadId, target) => ipc.draftHandoff(threadId, target),
       worktreeInfo: (projectId) => ipc.worktreeInfo(projectId),
+      cleanupPath: (threadId) => ipc.cleanupPath(threadId),
+      removeThreadWorktree: (threadId) => ipc.removeThreadWorktree(threadId),
+      deleteThreadBranch: (threadId) => ipc.deleteThreadBranch(threadId),
       async createThread(projectId, agent, base, parent) {
         try {
           const thread = await ipc.createThread(projectId, agent, base, parent);

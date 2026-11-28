@@ -100,6 +100,10 @@ function HandoffPanel({ thread, targets, onClose }: { thread: ThreadSummary; tar
 export function ThreadView() {
   const [changesOpen, setChangesOpen] = useState(false);
   const [handoffOpen, setHandoffOpen] = useState(false);
+  const [cleanup, setCleanup] = useState<{ threadId: string; path: string; action: "remove" | "branch" | null } | null>(null);
+  const [cleanupError, setCleanupError] = useState<string | null>(null);
+  const [cleanupMessage, setCleanupMessage] = useState<string | null>(null);
+  const [cleanupBusy, setCleanupBusy] = useState(false);
   const threadId = useApp((s) => s.activeThreadId);
   const thread = useApp((s) =>
     Object.values(s.threads)
@@ -115,6 +119,9 @@ export function ThreadView() {
     () => agents.filter((agent) => agent.status.kind === "ready" && agent.id !== thread?.agent),
     [agents, thread?.agent],
   );
+  const cleanupPath = useApp((s) => s.cleanupPath);
+  const removeThreadWorktree = useApp((s) => s.removeThreadWorktree);
+  const deleteThreadBranch = useApp((s) => s.deleteThreadBranch);
   const remembersApprovals = useApp((s) => s.agents.some((agent) =>
     agent.id === thread?.agent && agent.remembersApprovals,
   ));
@@ -134,8 +141,27 @@ export function ThreadView() {
           <button disabled={running || thread.archived || archivePending || targets.length === 0} onClick={() => setHandoffOpen((open) => !open)}>Hand off</button>
         ) : null}
         {thread ? <button type="button" disabled={running || archivePending} onClick={() => void setArchived(thread.id, !thread.archived)}>{thread.archived ? "Restore" : "Archive"}</button> : null}
+        {thread?.archived ? <button type="button" onClick={() => {
+          setCleanupError(null);
+          setCleanupMessage(null);
+          void cleanupPath(thread.id).then((path) => path ? setCleanup({ threadId: thread.id, path, action: null }) : setCleanupError("This thread has no worktree."), (error: unknown) => setCleanupError(String(error)));
+        }}>Worktree cleanup</button> : null}
         {thread ? <span className="muted">{thread.archived ? "archived" : running ? "running" : "idle"}</span> : null}
       </header>
+      {cleanup && cleanup.threadId === threadId ? <section aria-label="Worktree cleanup">
+        <p>Worktree: {cleanup.path}</p>
+        {cleanup.action === null ? <><button type="button" onClick={() => setCleanup({ ...cleanup, action: "remove" })}>Remove worktree</button><button type="button" onClick={() => setCleanup({ ...cleanup, action: "branch" })}>Delete branch</button></> : <>
+          <p>{cleanup.action === "remove" ? `Remove the clean worktree at ${cleanup.path}?` : `Delete branch ${thread?.branch ?? ""}?`}</p>
+          <button type="button" disabled={cleanupBusy} onClick={() => {
+            setCleanupBusy(true); setCleanupError(null); setCleanupMessage(null);
+            const operation = cleanup.action === "remove" ? removeThreadWorktree(cleanup.threadId) : deleteThreadBranch(cleanup.threadId);
+            void operation.then(() => { setCleanupMessage(cleanup.action === "remove" ? "Worktree removed. The branch was kept." : "Branch deleted."); setCleanup({ ...cleanup, action: null }); }, (error: unknown) => setCleanupError(String(error))).finally(() => setCleanupBusy(false));
+          }}>Confirm {cleanup.action === "remove" ? "removal" : "branch deletion"}</button>
+          <button type="button" disabled={cleanupBusy} onClick={() => setCleanup({ ...cleanup, action: null })}>Cancel</button>
+        </>}
+      </section> : null}
+      {cleanupError ? <div role="alert">{cleanupError}</div> : null}
+      {cleanupMessage ? <div role="status">{cleanupMessage}</div> : null}
       {error ? (
         <div className="banner" role="alert">
           {error}

@@ -1721,6 +1721,230 @@ async fn archived_thread_reopens_and_restores_without_losing_work() {
         .unwrap();
 }
 
+// Fails if a thread with a removed worktree can be restored or loses its history.
+#[tokio::test]
+async fn removed_worktree_cannot_be_restored_but_history_remains_accessible() {
+    let w = world();
+    init_git(&w);
+    let (engine, _) = engine(&w, fixture("acp-cancel.jsonl"));
+    let project = engine.add_project(w.project.to_str().unwrap()).unwrap();
+    let thread = engine
+        .create_thread_in(&project.id, AgentId::QwenCode, Some("HEAD".into()))
+        .await
+        .unwrap();
+    let saved = hearth_core::store::Store::open(&w.db)
+        .unwrap()
+        .get_thread(&thread.id)
+        .unwrap();
+    engine.archive_thread(&thread.id).await.unwrap();
+    git_in(&w.project, &["worktree", "remove", &saved.cwd]);
+    let error = engine.restore_thread(&thread.id).unwrap_err();
+    assert!(error.to_string().contains("worktree"));
+    assert!(engine.load_thread(&thread.id).unwrap().thread.archived);
+}
+
+// Fails if cleanup removes the source, loses history, or silently deletes the branch.
+#[tokio::test]
+async fn clean_archive_cleanup_preserves_source_and_history_until_explicit_branch_deletion() {
+    let w = world();
+    init_git(&w);
+    let (engine, _) = engine(&w, fixture("acp-cancel.jsonl"));
+    let project = engine.add_project(w.project.to_str().unwrap()).unwrap();
+    let thread = engine
+        .create_thread_in(&project.id, AgentId::QwenCode, Some("HEAD".into()))
+        .await
+        .unwrap();
+    let saved = hearth_core::store::Store::open(&w.db)
+        .unwrap()
+        .get_thread(&thread.id)
+        .unwrap();
+    engine.archive_thread(&thread.id).await.unwrap();
+    engine.remove_thread_worktree(&thread.id).unwrap();
+    assert!(!Path::new(&saved.cwd).exists());
+    assert!(w.project.join("tracked").exists());
+    assert!(engine.load_thread(&thread.id).unwrap().thread.archived);
+    assert!(
+        !git_in(
+            &w.project,
+            &["branch", "--list", thread.branch.as_deref().unwrap()]
+        )
+        .is_empty()
+    );
+    assert!(engine.remove_thread_worktree(&thread.id).is_err());
+    let other = w.project.parent().unwrap().join("other-checkout");
+    git_in(
+        &w.project,
+        &[
+            "worktree",
+            "add",
+            other.to_str().unwrap(),
+            thread.branch.as_deref().unwrap(),
+        ],
+    );
+    assert!(engine.delete_thread_branch(&thread.id).is_err());
+    assert!(other.join("tracked").exists());
+    git_in(&w.project, &["worktree", "remove", other.to_str().unwrap()]);
+    engine.delete_thread_branch(&thread.id).unwrap();
+    assert!(
+        git_in(
+            &w.project,
+            &["branch", "--list", thread.branch.as_deref().unwrap()]
+        )
+        .is_empty()
+    );
+}
+
+// Fails if dirty worktrees or unmerged branches are removed.
+#[tokio::test]
+async fn cleanup_refuses_dirty_worktrees_and_unmerged_branches() {
+    {
+        let w = world();
+        init_git(&w);
+        let (engine, _) = engine(&w, fixture("acp-cancel.jsonl"));
+        let project = engine.add_project(w.project.to_str().unwrap()).unwrap();
+        let thread = engine
+            .create_thread_in(&project.id, AgentId::QwenCode, Some("HEAD".into()))
+            .await
+            .unwrap();
+        let saved = hearth_core::store::Store::open(&w.db)
+            .unwrap()
+            .get_thread(&thread.id)
+            .unwrap();
+        let nested = Path::new(&saved.cwd).join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        engine.add_project(nested.to_str().unwrap()).unwrap();
+        engine.archive_thread(&thread.id).await.unwrap();
+        assert!(engine.remove_thread_worktree(&thread.id).is_err());
+        assert!(Path::new(&saved.cwd).join("tracked").exists());
+    }
+    let w = world();
+    init_git(&w);
+    let (engine, _) = engine(&w, fixture("acp-cancel.jsonl"));
+    let project = engine.add_project(w.project.to_str().unwrap()).unwrap();
+    let thread = engine
+        .create_thread_in(&project.id, AgentId::QwenCode, Some("HEAD".into()))
+        .await
+        .unwrap();
+    let saved = hearth_core::store::Store::open(&w.db)
+        .unwrap()
+        .get_thread(&thread.id)
+        .unwrap();
+    let worktree = Path::new(&saved.cwd);
+    std::fs::write(worktree.join("tracked"), "changes").unwrap();
+    engine.archive_thread(&thread.id).await.unwrap();
+    assert!(engine.remove_thread_worktree(&thread.id).is_err());
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("tracked")).unwrap(),
+        "changes"
+    );
+    git_in(worktree, &["add", "tracked"]);
+    git_in(
+        worktree,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "unmerged",
+        ],
+    );
+    engine.remove_thread_worktree(&thread.id).unwrap();
+    assert!(engine.delete_thread_branch(&thread.id).is_err());
+    assert!(
+        !git_in(
+            &w.project,
+            &["branch", "--list", thread.branch.as_deref().unwrap()]
+        )
+        .is_empty()
+    );
+}
+
+// Fails if removal deletes a modified skip-worktree or assume-unchanged file.
+#[tokio::test]
+async fn removal_refuses_files_hidden_from_git_status() {
+    for flag in ["--skip-worktree", "--assume-unchanged"] {
+        let w = world();
+        init_git(&w);
+        let (engine, _) = engine(&w, fixture("acp-cancel.jsonl"));
+        let project = engine.add_project(w.project.to_str().unwrap()).unwrap();
+        let thread = engine
+            .create_thread_in(&project.id, AgentId::QwenCode, Some("HEAD".into()))
+            .await
+            .unwrap();
+        let saved = hearth_core::store::Store::open(&w.db)
+            .unwrap()
+            .get_thread(&thread.id)
+            .unwrap();
+        let worktree = Path::new(&saved.cwd);
+        git_in(worktree, &["update-index", flag, "tracked"]);
+        std::fs::write(worktree.join("tracked"), "hidden changes").unwrap();
+        engine.archive_thread(&thread.id).await.unwrap();
+        assert!(engine.remove_thread_worktree(&thread.id).is_err(), "{flag}");
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("tracked")).unwrap(),
+            "hidden changes",
+            "{flag}"
+        );
+    }
+}
+
+// Fails if branch deletion leaves an external worktree on a deleted branch.
+#[tokio::test]
+async fn branch_deletion_restores_a_branch_an_external_checkout_took_meanwhile() {
+    let w = world();
+    init_git(&w);
+    let (engine, _) = engine(&w, fixture("acp-cancel.jsonl"));
+    let project = engine.add_project(w.project.to_str().unwrap()).unwrap();
+    let thread = engine
+        .create_thread_in(&project.id, AgentId::QwenCode, Some("HEAD".into()))
+        .await
+        .unwrap();
+    let branch = thread.branch.clone().unwrap();
+    engine.archive_thread(&thread.id).await.unwrap();
+    engine.remove_thread_worktree(&thread.id).unwrap();
+    let tip = git_in(&w.project, &["rev-parse", &branch]);
+    let linked = w.project.parent().unwrap().join("linked-checkout");
+    git_in(
+        &w.project,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            linked.to_str().unwrap(),
+        ],
+    );
+    let hooks = w.home.join("hooks");
+    std::fs::create_dir(&hooks).unwrap();
+    let done = w.home.join("hook-done");
+    let hook = hooks.join("reference-transaction");
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\n[ \"$1\" = prepared ] || exit 0\n[ -e '{done}' ] && exit 0\ngrep -q 'refs/heads/{branch}' || exit 0\n: > '{done}'\ngit -C '{linked}' switch -q '{branch}' || exit 1\n",
+            done = done.display(),
+            linked = linked.display(),
+            branch = branch,
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(
+        w.home.join(".gitconfig"),
+        format!("[core]\n hooksPath = {}\n", hooks.display()),
+    )
+    .unwrap();
+    assert!(engine.delete_thread_branch(&thread.id).is_err());
+    assert!(done.exists());
+    assert_eq!(git_in(&w.project, &["rev-parse", &branch]), tip);
+    assert_eq!(git_in(&linked, &["rev-parse", "HEAD"]), tip);
+    assert!(git_in(&linked, &["status", "--porcelain"]).is_empty());
+    assert!(engine.delete_thread_branch(&thread.id).is_err());
+    assert_eq!(git_in(&w.project, &["rev-parse", &branch]), tip);
+}
+
 // Fails if archive can interrupt a running turn or pending approval.
 #[tokio::test]
 async fn archive_refuses_a_running_turn() {

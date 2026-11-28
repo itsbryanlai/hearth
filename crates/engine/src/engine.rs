@@ -854,6 +854,19 @@ impl Engine {
         let mut store = lock(&self.inner.store);
         let thread = store.get_thread(id)?;
         if thread.status == ThreadStatus::Archived {
+            if let Some(path) = thread.worktree_path.as_deref() {
+                let project = store
+                    .list_projects()?
+                    .into_iter()
+                    .find(|project| project.id == thread.project_id)
+                    .ok_or("unknown project")?;
+                hearth_core::git::validate_in(
+                    Path::new(&project.path),
+                    &self.inner.home,
+                    Path::new(path),
+                    thread.worktree_parent.as_deref().map(Path::new),
+                ).map_err(|error| EngineError(format!("Cannot restore this thread: its worktree is unavailable or invalid ({error}).")))?;
+            }
             store.update_thread_status(id, ThreadStatus::Idle)?;
         }
         thread_summary(&store, &store.get_thread(id)?)
@@ -1046,6 +1059,130 @@ impl Engine {
         let previous = self.inner.sessions.lock().await.remove(id);
         drop(previous);
         self.start_turn(id, UserInput::Text { text }, running).await
+    }
+
+    pub fn cleanup_path(&self, id: &ThreadId) -> Result<Option<String>, EngineError> {
+        let store = lock(&self.inner.store);
+        let thread = store.get_thread(id)?;
+        if thread.status != ThreadStatus::Archived {
+            return Err("Archive this thread before cleanup.".into());
+        }
+        Ok(thread.worktree_path)
+    }
+
+    pub fn remove_thread_worktree(&self, id: &ThreadId) -> Result<(), EngineError> {
+        let _work = self.reserve_models(id)?;
+        let mut store = lock(&self.inner.store);
+        let thread = store.get_thread(id)?;
+        if thread.status != ThreadStatus::Archived {
+            return Err("Archive this thread before cleanup.".into());
+        }
+        let path = thread
+            .worktree_path
+            .as_deref()
+            .ok_or("This thread does not have a worktree.")?;
+        if thread.cwd != path {
+            return Err("The recorded checkout does not match the worktree.".into());
+        }
+        let projects = store.list_projects()?;
+        let project = projects
+            .iter()
+            .find(|project| project.id == thread.project_id)
+            .ok_or("unknown project")?;
+        for other_project in &projects {
+            if Path::new(&other_project.path).starts_with(path) {
+                return Err("This worktree is also an open project.".into());
+            }
+            for other in store.list_threads(&other_project.id)? {
+                if other.id != *id
+                    && (Path::new(&other.cwd).starts_with(path)
+                        || other
+                            .worktree_path
+                            .as_deref()
+                            .is_some_and(|other_path| Path::new(other_path).starts_with(path)))
+                {
+                    return Err("Another thread uses this checkout.".into());
+                }
+            }
+        }
+        let branch = thread
+            .branch
+            .as_deref()
+            .ok_or("Worktree branch is unknown.")?;
+        // The guard stores canonical roots; resolve before the directory is gone.
+        let guard_path = lock(&self.inner.guard)
+            .try_check(Path::new(path))
+            .map(|canonical| canonical.as_path().to_path_buf())
+            .unwrap_or_else(|_| PathBuf::from(path));
+        let tip = hearth_core::git::remove_worktree(
+            Path::new(&project.path),
+            &self.inner.home,
+            Path::new(path),
+            thread.worktree_parent.as_deref().map(Path::new),
+            branch,
+        )
+        .map_err(EngineError)?;
+        lock(&self.inner.guard).remove_root(&guard_path);
+        store.set_setting(&format!("worktree-removal:{}", id.0), &json!({"branch": branch, "tip": tip}))
+            .map_err(|error| EngineError(format!("Worktree was removed, but its removal could not be recorded; the branch was kept: {error}")))?;
+        Ok(())
+    }
+
+    pub fn delete_thread_branch(&self, id: &ThreadId) -> Result<(), EngineError> {
+        let _work = self.reserve_models(id)?;
+        let mut store = lock(&self.inner.store);
+        let thread = store.get_thread(id)?;
+        if thread.status != ThreadStatus::Archived {
+            return Err("Archive this thread before cleanup.".into());
+        }
+        let path = thread
+            .worktree_path
+            .as_deref()
+            .ok_or("This thread does not have a worktree.")?;
+        let branch = thread
+            .branch
+            .as_deref()
+            .ok_or("Worktree branch is unknown.")?;
+        let receipt = store
+            .get_setting(&format!("worktree-removal:{}", id.0))?
+            .ok_or("No successful worktree removal was recorded.")?;
+        if receipt.get("branch").and_then(Value::as_str) != Some(branch) {
+            return Err("Removal record does not match the branch.".into());
+        }
+        let tip = receipt
+            .get("tip")
+            .and_then(Value::as_str)
+            .ok_or("Removal record has no branch tip.")?;
+        let projects = store.list_projects()?;
+        let project = projects
+            .iter()
+            .find(|p| p.id == thread.project_id)
+            .ok_or("unknown project")?;
+        for other_project in &projects {
+            for other in store.list_threads(&other_project.id)? {
+                if other.id != *id
+                    && (other.branch.as_deref() == Some(branch)
+                        || other.cwd == path
+                        || other.worktree_path.as_deref() == Some(path))
+                {
+                    return Err("Another thread uses this checkout or branch.".into());
+                }
+            }
+        }
+        let key = format!("worktree-removal:{}", id.0);
+        store.set_setting(&key, &Value::Null)?;
+        if let Err(error) = hearth_core::git::delete_worktree_branch(
+            Path::new(&project.path),
+            &self.inner.home,
+            Path::new(path),
+            thread.worktree_parent.as_deref().map(Path::new),
+            branch,
+            tip,
+        ) {
+            store.set_setting(&key, &receipt)?;
+            return Err(EngineError(error));
+        }
+        Ok(())
     }
 
     pub async fn list_thread_models(&self, thread: &ThreadId) -> Result<ThreadModels, EngineError> {

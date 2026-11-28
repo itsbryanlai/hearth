@@ -108,6 +108,10 @@ impl FsGuard {
         }
     }
 
+    pub fn remove_root(&mut self, root: &Path) {
+        self.roots.retain(|existing| existing != root);
+    }
+
     /// Check one component of a project's sibling worktree directory without
     /// enrolling its parent as a readable root.
     pub fn worktree_component(
