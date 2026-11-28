@@ -100,9 +100,21 @@ pre { margin: 4px 0 0; white-space: pre-wrap; word-break: break-word; background
 .changes-diff { display: flex; flex-direction: column; flex: 1; min-width: 0; min-height: 0; }
 .diff-scroll { overflow: auto; flex: 1; min-height: 0; }
 .diff-row { position: absolute; top: 0; left: 0; width: 100%; height: 24px; display: flex; white-space: pre; font-family: monospace; }
-.diff-row span { flex: 1; min-width: 0; }
-.diff-row.add { margin-top: 0; }
+.diff-row > span { flex: 1; min-width: 0; }
+.diff-row.add, .diff-cell.add { margin-top: 0; }
 .diff-row.unified.add, .diff-cell.add { background: var(--diff-add-bg); }
 .diff-row.unified.delete, .diff-cell.delete { background: var(--diff-delete-bg); }
 .diff-row.header { color: var(--muted); }
 .diff-row .diff-cell { flex: 1 1 0; width: 0; overflow-x: auto; overflow-y: hidden; }
+.diff-row .syntax-comment { color: #637069; font-style: italic; }
+.diff-row .syntax-string { color: #087340; }
+.diff-row .syntax-keyword { color: #8a3e9c; }
+.diff-row .syntax-number { color: #a04b19; }
+.diff-row .syntax-function { color: #245db1; }
+@media (prefers-color-scheme: dark) {
+  .diff-row .syntax-comment { color: #a8b7ae; }
+  .diff-row .syntax-string { color: #86dca9; }
+  .diff-row .syntax-keyword { color: #e4a6ed; }
+  .diff-row .syntax-number { color: #ffc08a; }
+  .diff-row .syntax-function { color: #a6c8ff; }
+}
