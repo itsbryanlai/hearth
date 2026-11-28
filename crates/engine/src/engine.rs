@@ -4,8 +4,9 @@ use crate::agents::{
     AgentItem, AgentSession, AgentStream, EnvPassthrough, Registration, StreamItem,
 };
 use crate::api::{
-    AgentStatus, EngineError, EventSink, InstalledAgent, Project, ReviewTurn, ThreadEventPayload,
-    ThreadModels, ThreadSnapshot, ThreadSummary, TurnSnapshot, WorktreeInfo, WorktreeReview,
+    AgentStatus, EngineError, EventSink, HandoffDraft, InstalledAgent, Project, ReviewTurn,
+    ThreadEventPayload, ThreadModels, ThreadSnapshot, ThreadSummary, TurnSnapshot, WorktreeInfo,
+    WorktreeReview,
 };
 use crate::coalesce::coalesce;
 use hearth_core::fsguard::FsGuard;
@@ -859,7 +860,14 @@ impl Engine {
     }
 
     /// Prepare an editable hand-off from the stored, normalized transcript.
-    pub fn draft_handoff(&self, id: &ThreadId) -> Result<(ThreadId, String), EngineError> {
+    /// Nothing is stored, no session is opened and no agent is called.
+    pub async fn draft_handoff(
+        &self,
+        id: &ThreadId,
+        target: AgentId,
+    ) -> Result<HandoffDraft, EngineError> {
+        let (thread, session, _) = self.thread_session(id)?;
+        self.check_handoff_target(&thread, &session, &target)?;
         let snapshot = self.load_thread(id)?;
         let messages: Vec<&str> = snapshot
             .turns
@@ -939,7 +947,105 @@ impl Engine {
                 }
             }
         }
-        Ok((snapshot.thread.id, draft))
+        draft.push_str("\nWorking tree:\n");
+        match self.handoff_changes(&thread).await {
+            Some(files) if files.is_empty() => draft.push_str("No changed files.\n"),
+            Some(files) => {
+                for file in files {
+                    draft.push_str(&format!("{}: {}\n", file.status, file.path));
+                }
+            }
+            None => draft.push_str("Git context is unavailable for this thread.\n"),
+        }
+        Ok(HandoffDraft {
+            thread_id: snapshot.thread.id,
+            source_agent: session.agent,
+            target_agent: target,
+            text: draft,
+        })
+    }
+
+    fn check_handoff_target(
+        &self,
+        thread: &store::Thread,
+        session: &store::AgentSession,
+        target: &AgentId,
+    ) -> Result<(), EngineError> {
+        if thread.status == ThreadStatus::Archived {
+            return Err("This thread is archived.".into());
+        }
+        if &session.agent == target {
+            return Err("This thread already uses that agent.".into());
+        }
+        self.registration(target)?;
+        Ok(())
+    }
+
+    /// Changed paths from the guarded capture the Changes panel uses.
+    #[cfg(unix)]
+    async fn handoff_changes(
+        &self,
+        thread: &store::Thread,
+    ) -> Option<Vec<hearth_core::snapshot::DiffFile>> {
+        thread.base_ref.as_ref()?;
+        let id = self.start_worktree_review(&thread.id);
+        let review = self.worktree_diff_files(&thread.id, &id).await.ok()??;
+        Some(review.files)
+    }
+
+    #[cfg(not(unix))]
+    async fn handoff_changes(
+        &self,
+        _: &store::Thread,
+    ) -> Option<Vec<hearth_core::snapshot::DiffFile>> {
+        None
+    }
+
+    /// Switches the thread to `target` and sends the edited preamble as the
+    /// first turn of the new agent session. Source turns stay unchanged.
+    pub async fn start_handoff(
+        &self,
+        id: &ThreadId,
+        target: AgentId,
+        text: String,
+    ) -> Result<ThreadSummary, EngineError> {
+        if text.trim().is_empty() {
+            return Err("The hand-off message is empty.".into());
+        }
+        let running = Arc::new(RunningTurn::default());
+        match lock(&self.inner.work).entry(id.clone()) {
+            Entry::Occupied(_) => {
+                return Err("Wait for the current turn or model operation to finish.".into());
+            }
+            Entry::Vacant(entry) => entry.insert(ThreadWork::Turn(running.clone())),
+        };
+        let started = self.switch_and_send(id, target, text, running).await;
+        if started.is_err() {
+            lock(&self.inner.work).remove(id);
+        }
+        started
+    }
+
+    async fn switch_and_send(
+        &self,
+        id: &ThreadId,
+        target: AgentId,
+        text: String,
+        running: Arc<RunningTurn>,
+    ) -> Result<ThreadSummary, EngineError> {
+        let (thread, session, _) = self.thread_session(id)?;
+        self.check_handoff_target(&thread, &session, &target)?;
+        let registered = self.registration(&target)?;
+        if !matches!(registered.adapter.availability().await, AgentStatus::Ready) {
+            return Err(EngineError(format!(
+                "{} is not available.",
+                registered.label
+            )));
+        }
+        lock(&self.inner.store).switch_agent(id, &target)?;
+        let previous = self.inner.sessions.lock().await.remove(id);
+        drop(previous);
+        self.start_turn(id, UserInput::Text { text }, running).await
     }
 
     pub async fn list_thread_models(&self, thread: &ThreadId) -> Result<ThreadModels, EngineError> {

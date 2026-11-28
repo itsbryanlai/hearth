@@ -567,6 +567,29 @@ impl Store {
         Ok(())
     }
 
+    /// Switches the thread to `agent`: a new empty session row (same permission
+    /// mode, no model or native session) and no remembered model choice, which
+    /// belonged to the previous agent. One transaction.
+    pub fn switch_agent(&mut self, thread: &ThreadId, agent: &AgentId) -> Result<AgentSessionId> {
+        let next = AgentSessionId::new();
+        let tx = self.conn.transaction()?;
+        let affected = tx.execute(
+            &format!(
+                "INSERT INTO agent_sessions (id, thread_id, agent_id, model, permission_mode, external_session_id, started_at)
+                 SELECT ?1, thread_id, ?2, '', permission_mode, NULL, {NOW_MS}
+                 FROM agent_sessions WHERE thread_id = ?3
+                 ORDER BY started_at DESC, rowid DESC LIMIT 1"
+            ),
+            params![next.0, to_text(agent)?, thread.0],
+        )?;
+        if affected == 0 {
+            return Err(rusqlite::Error::QueryReturnedNoRows.into());
+        }
+        tx.execute("DELETE FROM settings WHERE key = ?1", [model_key(thread)])?;
+        tx.commit()?;
+        Ok(next)
+    }
+
     /// Records the ready model on the first turn, or starts another attribution row.
     pub fn prepare_turn_session(
         &mut self,

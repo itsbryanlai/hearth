@@ -74,6 +74,16 @@ pub struct ReviewTurn {
     pub available: bool,
 }
 
+/// An editable hand-off preamble for switching a thread to another agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HandoffDraft {
+    pub thread_id: ThreadId,
+    pub source_agent: AgentId,
+    pub target_agent: AgentId,
+    pub text: String,
+}
+
 /// A captured review of a thread's current working copy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
