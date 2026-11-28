@@ -51,18 +51,14 @@ impl PrivateGit {
             .tempdir_in(&data)
             .map_err(|e| e.to_string())?;
         let repo = temp.path().join("git");
-        let status = Command::new("git")
-            .env_clear()
-            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .args(["-c", "init.templateDir=", "init", "--bare", "--quiet"])
-            .arg(&repo)
-            .status()
-            .map_err(|e| e.to_string())?;
-        if !status.success() {
-            return Err("cannot initialize private Git metadata".into());
-        }
+        std::fs::create_dir(&repo).map_err(|e| e.to_string())?;
+        std::fs::create_dir(repo.join("refs")).map_err(|e| e.to_string())?;
+        std::fs::write(repo.join("HEAD"), b"ref: refs/heads/main\n").map_err(|e| e.to_string())?;
+        std::fs::write(
+            repo.join("config"),
+            b"[core]\n\trepositoryformatversion = 0\n\tbare = true\n",
+        )
+        .map_err(|e| e.to_string())?;
         let index = temp.path().join("index");
         Ok(Self {
             _temp: temp,
