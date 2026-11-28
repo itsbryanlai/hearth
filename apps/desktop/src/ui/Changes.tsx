@@ -2,6 +2,8 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { DiffFile, DiffRow, FileDiff, ReviewTurn, WorktreeReview } from "../ipc/contract";
 import { useApp } from "../state/context";
+import type { HighlightedHunk, Span } from "./diffHighlight";
+import { diffLanguage } from "./diffLanguage";
 
 type Load<T> = { kind: "loading" } | { kind: "error" } | { kind: "ready"; value: T };
 
@@ -158,27 +160,32 @@ function ChangesFiles({ threadId, scope, files }: { threadId: string; scope: Sco
           })}
         </div>
       </nav>
-      {fileId ? <FileChanges key={fileId} threadId={threadId} scope={scope} fileId={fileId} /> : null}
+      {fileId ? <FileChanges key={fileId} threadId={threadId} scope={scope} fileId={fileId} path={list.find((file) => file.id === fileId)?.path ?? ""} /> : null}
     </div>
   );
 }
 
 type DisplayRow =
   | { kind: "header"; text: string }
-  | { kind: "unified"; row: DiffRow }
-  | { kind: "split"; left: DiffRow | undefined; right: DiffRow | undefined; notice: DiffRow | undefined };
+  | { kind: "unified"; row: DiffRow; hunkIndex: number; rowIndex: number }
+  | { kind: "split"; left: DiffRow | undefined; right: DiffRow | undefined; notice: DiffRow | undefined; hunkIndex: number; leftIndex: number | null; rightIndex: number | null };
 
-function RowContent({ row }: { row: DisplayRow }) {
+function SourceText({ text, spans }: { text: string; spans: Span[] | undefined }) {
+  if (!spans?.length) return text;
+  return spans.map((span, index) => <span key={index} className={`syntax-${span.kind}`}>{span.text}</span>);
+}
+
+function RowContent({ row, highlights }: { row: DisplayRow; highlights: HighlightedHunk[] | undefined }) {
   if (row.kind === "header") return row.text;
   if (row.kind === "split") {
     if (row.notice) return <span className="diff-notice">{row.notice.text}</span>;
     return (
       <>
         <span className={`diff-cell ${row.left?.kind ?? ""}`}>
-          {row.left ? `${row.left.oldLine ?? ""} ${row.left.kind === "delete" ? "−" : " "} ${row.left.text}` : ""}
+          {row.left ? <>{row.left.oldLine ?? ""} {row.left.kind === "delete" ? "−" : " "} <SourceText text={row.left.text} spans={row.leftIndex === null ? undefined : highlights?.[row.hunkIndex]?.old[row.leftIndex]} /></> : ""}
         </span>
         <span className={`diff-cell ${row.right?.kind ?? ""}`}>
-          {row.right ? `${row.right.newLine ?? ""} ${row.right.kind === "add" ? "+" : " "} ${row.right.text}` : ""}
+          {row.right ? <>{row.right.newLine ?? ""} {row.right.kind === "add" ? "+" : " "} <SourceText text={row.right.text} spans={row.rightIndex === null ? undefined : highlights?.[row.hunkIndex]?.new[row.rightIndex]} /></> : ""}
         </span>
       </>
     );
@@ -186,22 +193,24 @@ function RowContent({ row }: { row: DisplayRow }) {
   let marker = " ";
   if (row.row.kind === "add") marker = "+";
   else if (row.row.kind === "delete") marker = "−";
-  return <span>{row.row.oldLine ?? ""} {row.row.newLine ?? ""} {marker} {row.row.text}</span>;
+  return <span>{row.row.oldLine ?? ""} {row.row.newLine ?? ""} {marker} <SourceText text={row.row.text} spans={highlights?.[row.hunkIndex]?.[row.row.kind === "delete" ? "old" : "new"][row.rowIndex]} /></span>;
 }
 
-function FileChanges({ threadId, scope, fileId }: { threadId: string; scope: Scope; fileId: string }) {
+function FileChanges({ threadId, scope, fileId, path }: { threadId: string; scope: Scope; fileId: string; path: string }) {
   const loadTurn = useApp((s) => s.turnDiffFile);
   const loadWorktree = useApp((s) => s.worktreeDiffFile);
   const [diff, setDiff] = useState<Load<FileDiff | null>>({ kind: "loading" });
   const [split, setSplit] = useState(false);
+  const [highlighted, setHighlighted] = useState<{ diff: FileDiff; hunks: HighlightedHunk[] } | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const rows = useMemo<DisplayRow[]>(() => {
     if (diff.kind !== "ready" || !diff.value) return [];
-    return diff.value.hunks.flatMap((h): DisplayRow[] => {
+    return diff.value.hunks.flatMap((h, hunkIndex): DisplayRow[] => {
       const header: DisplayRow = { kind: "header", text: h.header };
-      if (!split) return [header, ...h.rows.map((row): DisplayRow => ({ kind: "unified", row }))];
+      if (!split) return [header, ...h.rows.map((row, rowIndex): DisplayRow => ({ kind: "unified", row, hunkIndex, rowIndex }))];
       return [header, ...h.splitRows.map((pair): DisplayRow => ({
         kind: "split",
+        hunkIndex, leftIndex: pair.left, rightIndex: pair.right,
         left: pair.left === null ? undefined : h.rows[pair.left],
         right: pair.right === null ? undefined : h.rows[pair.right],
         notice: pair.notice === null ? undefined : h.rows[pair.notice],
@@ -225,6 +234,25 @@ function FileChanges({ threadId, scope, fileId }: { threadId: string; scope: Sco
     return () => { live = false; };
   }, [threadId, scope.kind, scope.id, fileId, loadTurn, loadWorktree]);
 
+  useEffect(() => {
+    if (diff.kind !== "ready" || !diff.value || diff.value.binary || typeof Worker === "undefined" || !diffLanguage(path)) return;
+    const value = diff.value;
+    let worker: Worker | undefined;
+    try {
+      worker = new Worker(new URL("./diffHighlight.worker.ts", import.meta.url), { type: "module" });
+      worker.onmessage = (event: MessageEvent<HighlightedHunk[] | null>) => {
+        if (event.data) setHighlighted({ diff: value, hunks: event.data });
+      };
+      worker.postMessage({ path, diff: value });
+    } catch {
+      worker?.terminate();
+      return;
+    }
+    return () => { worker.onmessage = null; worker.terminate(); };
+  }, [diff, path, threadId, scope.kind, scope.id, fileId]);
+
+  const highlights = diff.kind === "ready" && highlighted?.diff === diff.value ? highlighted.hunks : undefined;
+
   let content;
   if (diff.kind === "loading") content = <p>Loading diff…</p>;
   else if (diff.kind === "error") content = <p role="alert">Could not load diff.</p>;
@@ -240,7 +268,7 @@ function FileChanges({ threadId, scope, fileId }: { threadId: string; scope: Sco
           const rowClass = row.kind === "unified" ? row.row.kind : row.kind === "split" ? row.left?.kind ?? row.right?.kind ?? "notice" : "header";
           return (
             <div key={item.key} className={`diff-row ${rowClass} ${row.kind}`} style={{ transform: `translateY(${item.start}px)` }}>
-              <RowContent row={row} />
+              <RowContent row={row} highlights={highlights} />
             </div>
           );
         })}
