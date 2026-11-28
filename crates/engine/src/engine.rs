@@ -1109,6 +1109,11 @@ impl Engine {
             .branch
             .as_deref()
             .ok_or("Worktree branch is unknown.")?;
+        // The guard stores canonical roots; resolve before the directory is gone.
+        let guard_path = lock(&self.inner.guard)
+            .try_check(Path::new(path))
+            .map(|canonical| canonical.as_path().to_path_buf())
+            .unwrap_or_else(|_| PathBuf::from(path));
         let tip = hearth_core::git::remove_worktree(
             Path::new(&project.path),
             &self.inner.home,
@@ -1117,7 +1122,7 @@ impl Engine {
             branch,
         )
         .map_err(EngineError)?;
-        lock(&self.inner.guard).remove_root(Path::new(path));
+        lock(&self.inner.guard).remove_root(&guard_path);
         store.set_setting(&format!("worktree-removal:{}", id.0), &json!({"branch": branch, "tip": tip}))
             .map_err(|error| EngineError(format!("Worktree was removed, but its removal could not be recorded; the branch was kept: {error}")))?;
         Ok(())

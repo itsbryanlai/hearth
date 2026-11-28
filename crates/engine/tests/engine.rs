@@ -1861,6 +1861,35 @@ async fn cleanup_refuses_dirty_worktrees_and_unmerged_branches() {
     );
 }
 
+// Fails if removal deletes a modified skip-worktree or assume-unchanged file.
+#[tokio::test]
+async fn removal_refuses_files_hidden_from_git_status() {
+    for flag in ["--skip-worktree", "--assume-unchanged"] {
+        let w = world();
+        init_git(&w);
+        let (engine, _) = engine(&w, fixture("acp-cancel.jsonl"));
+        let project = engine.add_project(w.project.to_str().unwrap()).unwrap();
+        let thread = engine
+            .create_thread_in(&project.id, AgentId::QwenCode, Some("HEAD".into()))
+            .await
+            .unwrap();
+        let saved = hearth_core::store::Store::open(&w.db)
+            .unwrap()
+            .get_thread(&thread.id)
+            .unwrap();
+        let worktree = Path::new(&saved.cwd);
+        git_in(worktree, &["update-index", flag, "tracked"]);
+        std::fs::write(worktree.join("tracked"), "hidden changes").unwrap();
+        engine.archive_thread(&thread.id).await.unwrap();
+        assert!(engine.remove_thread_worktree(&thread.id).is_err(), "{flag}");
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("tracked")).unwrap(),
+            "hidden changes",
+            "{flag}"
+        );
+    }
+}
+
 // Fails if branch deletion leaves an external worktree on a deleted branch.
 #[tokio::test]
 async fn branch_deletion_restores_a_branch_an_external_checkout_took_meanwhile() {

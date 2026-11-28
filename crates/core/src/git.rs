@@ -202,6 +202,18 @@ pub fn remove_worktree(
     {
         return Err("Worktree contains uncommitted or ignored files; removal refused.".into());
     }
+    // assume-unchanged and skip-worktree files are invisible to `status`.
+    if git(&path, home, &["ls-files", "-v", "-z"])?
+        .split('\0')
+        .any(|entry| {
+            entry
+                .chars()
+                .next()
+                .is_some_and(|tag| tag.is_ascii_lowercase() || tag == 'S')
+        })
+    {
+        return Err("Worktree has files hidden from Git status; removal refused.".into());
+    }
     let project = project_root(project, home)?;
     let path = path.to_str().ok_or("Worktree path is not valid UTF-8")?;
     git(&project, home, &["worktree", "remove", "--", path])?;
