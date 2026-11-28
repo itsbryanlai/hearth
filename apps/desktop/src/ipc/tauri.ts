@@ -13,8 +13,8 @@ export function createTauriIpc(): Ipc {
     addProject: (path) => invoke("add_project", { path }),
     listThreads: (projectId) => invoke("list_threads", { projectId }),
     worktreeInfo: (projectId) => invoke("worktree_info", { projectId }),
-    createThread: (projectId, agent, base) =>
-      invoke("create_thread", { projectId, agent, base }),
+    createThread: (projectId, agent, base, parent) =>
+      invoke("create_thread", { projectId, agent, base, parent }),
     loadThread: (threadId) => invoke("load_thread", { threadId }),
     listThreadModels: (threadId) => invoke("list_thread_models", { threadId }),
     setThreadModel: (threadId, modelId) => invoke("set_thread_model", { threadId, modelId }),

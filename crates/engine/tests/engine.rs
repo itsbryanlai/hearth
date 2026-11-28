@@ -968,6 +968,71 @@ async fn worktree_persists_and_reopens_with_the_source_untouched() {
     assert!(reopened.list_thread_models(&thread.id).await.is_err());
 }
 
+// Fails if a chosen parent is forgotten on reopen or the source checkout changes.
+#[tokio::test]
+async fn custom_worktree_parent_survives_reopen() {
+    let w = world();
+    init_git(&w);
+    let parent = w.project.parent().unwrap().join("chosen");
+    std::fs::create_dir(&parent).unwrap();
+    let (engine, _) = engine(&w, fixture("acp-cancel.jsonl"));
+    let project = engine.add_project(w.project.to_str().unwrap()).unwrap();
+    let thread = engine
+        .create_thread_in_parent(
+            &project.id,
+            AgentId::QwenCode,
+            Some("HEAD".into()),
+            Some(parent.to_string_lossy().into_owned()),
+        )
+        .await
+        .unwrap();
+    let store = hearth_core::store::Store::open(&w.db).unwrap();
+    let saved = store.get_thread(&thread.id).unwrap();
+    assert_eq!(
+        Path::new(&saved.cwd).parent().unwrap(),
+        parent.join("project")
+    );
+    assert_eq!(
+        std::fs::read_to_string(w.project.join("tracked")).unwrap(),
+        "base"
+    );
+    assert_eq!(
+        git_in(Path::new(&saved.cwd), &["branch", "--show-current"]),
+        thread.branch.unwrap()
+    );
+    drop(store);
+    drop(engine);
+    let (reopened, _) = self::engine(&w, fixture("acp-cancel.jsonl"));
+    reopened.list_thread_models(&thread.id).await.unwrap();
+}
+
+// Fails if protected, redirected, or in-project parents create a thread.
+#[tokio::test]
+async fn invalid_custom_parents_are_refused() {
+    let w = world();
+    init_git(&w);
+    let protected = w.home.join(".ssh");
+    std::fs::create_dir(&protected).unwrap();
+    let link = w.project.parent().unwrap().join("redirected");
+    std::os::unix::fs::symlink(&w.home, &link).unwrap();
+    let (engine, _) = engine(&w, fixture("acp-cancel.jsonl"));
+    let project = engine.add_project(w.project.to_str().unwrap()).unwrap();
+    for parent in [&protected, &link, &w.project, w.project.parent().unwrap()] {
+        assert!(
+            engine
+                .create_thread_in_parent(
+                    &project.id,
+                    AgentId::QwenCode,
+                    Some("HEAD".into()),
+                    Some(parent.to_string_lossy().into_owned())
+                )
+                .await
+                .is_err()
+        );
+    }
+    assert!(engine.list_threads(&project.id).unwrap().is_empty());
+}
+
 // Fails if an invalid base or a symlinked destination creates a thread or changes the source.
 #[tokio::test]
 async fn worktree_refuses_invalid_base_and_symlink_destination() {

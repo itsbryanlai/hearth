@@ -73,7 +73,7 @@ export interface Ipc {
   addProject(path: string): Promise<Project>;
   listThreads(projectId: ProjectId): Promise<ThreadSummary[]>;
   worktreeInfo(projectId: ProjectId): Promise<{ isGit: boolean; base: string | null; reason: string | null }>;
-  createThread(projectId: ProjectId, agent: AgentId, base: string | null): Promise<ThreadSummary>;
+  createThread(projectId: ProjectId, agent: AgentId, base: string | null, parent?: string | null): Promise<ThreadSummary>;
   loadThread(threadId: ThreadId): Promise<ThreadSnapshot>;
   listThreadModels(threadId: ThreadId): Promise<ThreadModels>;
   setThreadModel(threadId: ThreadId, modelId: string): Promise<ThreadSummary>;

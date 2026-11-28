@@ -25,10 +25,14 @@ export function Sidebar() {
   const createThread = useApp((s) => s.createThread);
   const worktreeInfo = useApp((s) => s.worktreeInfo);
   const request = useRef(0);
+  const creating = useRef(false);
+  const [pending, setPending] = useState(false);
+  const [createError, setCreateError] = useState("");
   const [info, setInfo] = useState<{ project: string; isGit: boolean; base: string | null; reason: string | null } | null>(null);
   const [infoError, setInfoError] = useState("");
   const [mode, setMode] = useState<"repo" | "worktree">("repo");
   const [base, setBase] = useState("");
+  const [parent, setParent] = useState("");
   const addProject = useApp((s) => s.addProject);
   const [adding, setAdding] = useState(false);
   const [path, setPath] = useState("");
@@ -44,12 +48,14 @@ export function Sidebar() {
             <button
               type="button"
               className="quiet"
-              disabled={agents.length === 0}
+              disabled={agents.length === 0 || pending}
               onClick={() => {
                 setAgentId(ready?.id ?? "");
                 setAgentProject(p.id);
                 setInfo(null);
+                setParent("");
                 setInfoError("");
+                setCreateError("");
                 const current = ++request.current;
                 void worktreeInfo(p.id).then((result) => {
                   if (request.current !== current) return;
@@ -68,10 +74,16 @@ export function Sidebar() {
               onSubmit={(event) => {
                 event.preventDefault();
                 const selected = agents.find((agent) => agent.id === agentId);
-                if (selected?.status.kind !== "ready" || info?.project !== p.id) return;
-                request.current++;
-                setAgentProject(null);
-                void createThread(p.id, selected.id, mode === "worktree" ? base : null);
+                if (creating.current || selected?.status.kind !== "ready" || info?.project !== p.id) return;
+                creating.current = true;
+                setPending(true);
+                setCreateError("");
+                void createThread(p.id, selected.id, mode === "worktree" ? base : null, mode === "worktree" ? parent.trim() || null : null).then((error) => {
+                  creating.current = false;
+                  setPending(false);
+                  if (error !== null) setCreateError(error);
+                  else { request.current++; setAgentProject(null); }
+                });
               }}
             >
               <select aria-label="Agent" value={agentId} onChange={(event) => setAgentId(event.target.value)}>
@@ -90,13 +102,14 @@ export function Sidebar() {
                       <option value="worktree" disabled={!info.isGit}>Work in new worktree</option>
                     </select>
                   </label>
-                  {mode === "worktree" ? <label>Base <input aria-label="Base" value={base} onChange={(event) => setBase(event.target.value)} /></label> : null}
+                  {mode === "worktree" ? <> <label>Base <input aria-label="Base" value={base} onChange={(event) => setBase(event.target.value)} /></label><label>Worktree parent (existing folder) <input aria-label="Worktree parent" placeholder="Default: sibling .hearth-worktrees" value={parent} onChange={(event) => setParent(event.target.value)} /></label></> : null}
                   {info.reason ? <p>{info.reason}</p> : null}
                   {info.isGit && !info.base ? <p>No usable current base commit. Choose a base for a worktree.</p> : null}
                 </>
               ) : infoError ? <p role="alert">{infoError}</p> : <p>Checking project…</p>}
-              <button type="submit" disabled={!ready || info?.project !== p.id || (mode === "worktree" && !base.trim())}>Create thread</button>
-              <button type="button" className="quiet" onClick={() => { request.current++; setAgentProject(null); }}>Cancel</button>
+              {createError ? <p role="alert">{createError}</p> : null}
+              <button type="submit" disabled={pending || !ready || info?.project !== p.id || (mode === "worktree" && !base.trim())}>Create thread</button>
+              <button type="button" className="quiet" disabled={pending} onClick={() => { request.current++; setAgentProject(null); }}>Cancel</button>
             </form>
           ) : null}
           <ul>

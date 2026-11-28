@@ -38,7 +38,7 @@ export type AppState = {
   init(): Promise<void>;
   addProject(path: string): Promise<void>;
   worktreeInfo(projectId: string): Promise<{ isGit: boolean; base: string | null; reason: string | null }>;
-  createThread(projectId: string, agent: AgentId, base: string | null): Promise<void>;
+  createThread(projectId: string, agent: AgentId, base: string | null, parent?: string | null): Promise<string | null>;
   selectThread(threadId: string): Promise<void>;
   loadModels(threadId: string): Promise<void>;
   setModel(threadId: string, modelId: string): Promise<void>;
@@ -186,16 +186,17 @@ export function createAppStore(ipc: Ipc, options: Options = {}): AppStore {
         }
       },
       worktreeInfo: (projectId) => ipc.worktreeInfo(projectId),
-      async createThread(projectId, agent, base) {
+      async createThread(projectId, agent, base, parent) {
         try {
-          const thread = await ipc.createThread(projectId, agent, base);
+          const thread = await ipc.createThread(projectId, agent, base, parent);
           set((s) => ({
             threads: { ...s.threads, [projectId]: [...(s.threads[projectId] ?? []), thread] },
             transcripts: { ...s.transcripts, [thread.id]: emptyTranscript },
             activeThreadId: thread.id,
           }));
+          return null;
         } catch (e) {
-          fail(e);
+          return e instanceof Error ? e.message : String(e);
         }
       },
       async selectThread(threadId) {

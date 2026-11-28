@@ -326,7 +326,7 @@ test.each([
     }
     await vi.waitFor(() => expect(screen.getByRole("button", { name: "Create thread" })).not.toHaveProperty("disabled", true));
     fireEvent.click(screen.getByRole("button", { name: "Create thread" }));
-    await vi.waitFor(() => expect(ipc.createThread).toHaveBeenCalledWith("p", expected, null));
+    await vi.waitFor(() => expect(ipc.createThread).toHaveBeenCalledWith("p", expected, null, null));
   },
 );
 
@@ -343,9 +343,41 @@ test.each([
   const directory = await screen.findByRole("combobox", { name: "Working directory" });
   expect(directory).toHaveProperty("value", "worktree");
   fireEvent.change(screen.getByRole("textbox", { name: "Base" }), { target: { value: "topic" } });
-  if (mode === "repo") fireEvent.change(directory, { target: { value: "repo" } });
+  fireEvent.change(screen.getByRole("textbox", { name: "Worktree parent" }), { target: { value: "/tmp/trees" } });
+  if (mode === "repo") {
+    fireEvent.change(directory, { target: { value: "repo" } });
+    expect(screen.queryByRole("textbox", { name: "Worktree parent" })).toBeNull();
+  }
   fireEvent.click(screen.getByRole("button", { name: "Create thread" }));
-  await vi.waitFor(() => expect(ipc.createThread).toHaveBeenCalledWith("p", CLAUDE.id, expected));
+  await vi.waitFor(() => expect(ipc.createThread).toHaveBeenCalledWith("p", CLAUDE.id, expected, mode === "worktree" ? "/tmp/trees" : null));
+});
+
+// Fails if a rejected creation loses the chosen inputs or allows duplicate submissions.
+test("worktree creation retains inputs after failure and closes after retry", async () => {
+  const { ipc } = fakeIpc();
+  ipc.worktreeInfo.mockResolvedValue({ isGit: true, base: "main", reason: null });
+  let rejectCreation: (error: Error) => void = () => {};
+  ipc.createThread.mockImplementationOnce(() => new Promise((_, reject) => { rejectCreation = reject; }));
+  ipc.createThread.mockResolvedValueOnce(THREAD);
+  render(<App store={createAppStore(ipc)} />);
+  fireEvent.click(await screen.findByRole("button", { name: "+ Thread" }));
+  const base = await screen.findByRole("textbox", { name: "Base" });
+  const parent = screen.getByRole("textbox", { name: "Worktree parent" });
+  fireEvent.change(base, { target: { value: "topic" } });
+  fireEvent.change(parent, { target: { value: "/tmp/missing" } });
+  const submit = screen.getByRole("button", { name: "Create thread" });
+  fireEvent.click(submit);
+  expect(submit).toHaveProperty("disabled", true);
+  fireEvent.click(submit);
+  expect(ipc.createThread).toHaveBeenCalledTimes(1);
+  await act(async () => rejectCreation(new Error("Folder does not exist")));
+  expect((await screen.findByRole("alert")).textContent).toContain("Folder does not exist");
+  expect(base).toHaveProperty("value", "topic");
+  expect(parent).toHaveProperty("value", "/tmp/missing");
+  fireEvent.change(parent, { target: { value: "/tmp/existing" } });
+  fireEvent.click(submit);
+  await vi.waitFor(() => expect(screen.queryByRole("button", { name: "Create thread" })).toBeNull());
+  expect(ipc.createThread).toHaveBeenLastCalledWith("p", CLAUDE.id, "topic", "/tmp/existing");
 });
 
 // Fails if an agent without a known approval scope offers a remembered approval.

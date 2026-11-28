@@ -78,6 +78,15 @@ fn parent(project: &Path) -> Result<PathBuf, String> {
 }
 
 pub fn create(project: &Path, home: &Path, requested_base: &str) -> Result<Worktree, String> {
+    create_in(project, home, requested_base, None)
+}
+
+pub fn create_in(
+    project: &Path,
+    home: &Path,
+    requested_base: &str,
+    selected: Option<&Path>,
+) -> Result<Worktree, String> {
     let project = project_root(project, home)?;
     let revision = format!("{requested_base}^{{commit}}");
     let base = git(
@@ -85,16 +94,17 @@ pub fn create(project: &Path, home: &Path, requested_base: &str) -> Result<Workt
         home,
         &["rev-parse", "--verify", "--end-of-options", &revision],
     )?;
-    let parent = parent(&project)?;
-    let top = parent.parent().ok_or("Invalid destination")?;
+    let default_parent = parent(&project)?;
+    let top = selected.unwrap_or(default_parent.parent().ok_or("Invalid destination")?);
+    let parent = top.join(project.file_name().ok_or("Project has no name")?);
     let guard = FsGuard::new([project.clone()], home.to_path_buf());
     for dir in [top, parent.as_path()] {
-        guard.worktree_component(&project, dir, true, false)?;
+        guard.worktree_component(&project, top, dir, selected.is_none() || dir != top, false)?;
     }
     let slug = ThreadId::new().0;
     let branch = format!("hearth/{slug}");
     let path = parent.join(&slug);
-    guard.worktree_component(&project, &path, false, true)?;
+    guard.worktree_component(&project, top, &path, false, true)?;
     let path_text = path.to_str().ok_or("Worktree path is not valid UTF-8")?;
     git(
         &project,
@@ -107,7 +117,7 @@ pub fn create(project: &Path, home: &Path, requested_base: &str) -> Result<Workt
             path.display()
         )
     })?;
-    let path = validate(&project, home, &path).map_err(|e| {
+    let path = validate_in(&project, home, &path, selected).map_err(|e| {
         format!(
             "{e}; worktree may need manual cleanup at {} on {branch}",
             path.display()
@@ -117,12 +127,22 @@ pub fn create(project: &Path, home: &Path, requested_base: &str) -> Result<Workt
 }
 
 pub fn validate(project: &Path, home: &Path, path: &Path) -> Result<PathBuf, String> {
+    validate_in(project, home, path, None)
+}
+
+pub fn validate_in(
+    project: &Path,
+    home: &Path,
+    path: &Path,
+    selected: Option<&Path>,
+) -> Result<PathBuf, String> {
     let project = project_root(project, home)?;
-    let parent = parent(&project)?;
-    let top = parent.parent().ok_or("Invalid destination")?;
+    let default_parent = parent(&project)?;
+    let top = selected.unwrap_or(default_parent.parent().ok_or("Invalid destination")?);
+    let parent = top.join(project.file_name().ok_or("Project has no name")?);
     let guard = FsGuard::new([project.clone()], home.to_path_buf());
     for dir in [top, parent.as_path(), path] {
-        guard.worktree_component(&project, dir, false, false)?;
+        guard.worktree_component(&project, top, dir, false, false)?;
     }
     let canonical = check_root(path, home)?;
     let expected_parent = check_root(&parent, home)?;
