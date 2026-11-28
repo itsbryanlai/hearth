@@ -149,6 +149,19 @@ pub struct LoadedThread {
     pub turns: Vec<LoadedTurn>,
 }
 
+/// One line of the local usage view: an agent and model with summed counts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageRow {
+    pub agent: AgentId,
+    pub model: String,
+    pub turns: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -745,6 +758,51 @@ impl Store {
         Ok(())
     }
 
+    /// Assistant turns grouped by agent and model with their summed usage.
+    /// A turn with no usage still counts as a turn; an empty model is "unknown".
+    pub fn usage_summary(&self) -> Result<Vec<UsageRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.agent_id,
+                    CASE WHEN s.model = '' THEN 'unknown' ELSE s.model END AS model_name,
+                    COUNT(t.id),
+                    COALESCE(SUM(u.input_tokens), 0),
+                    COALESCE(SUM(u.output_tokens), 0),
+                    COALESCE(SUM(u.cache_read), 0),
+                    COALESCE(SUM(u.cache_write), 0)
+             FROM turns t
+             JOIN agent_sessions s ON s.id = t.agent_session_id
+             LEFT JOIN usage u ON u.turn_id = t.id
+             WHERE t.role = 'assistant'
+             GROUP BY s.agent_id, model_name
+             ORDER BY s.agent_id, model_name",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, i64>(6)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (agent, model, turns, input, output, cache_read, cache_write) = row?;
+            out.push(UsageRow {
+                agent: from_text(&agent)?,
+                model,
+                turns: turns.max(0) as u64,
+                input_tokens: input.max(0) as u64,
+                output_tokens: output.max(0) as u64,
+                cache_read_tokens: cache_read.max(0) as u64,
+                cache_write_tokens: cache_write.max(0) as u64,
+            });
+        }
+        Ok(out)
+    }
+
     pub fn get_usage(&self, turn: &TurnId) -> Result<Option<TokenUsage>> {
         Ok(self
             .conn
@@ -918,6 +976,82 @@ mod tests {
             event: e,
             raw: None,
         }
+    }
+
+    // Fails if usage is attributed to the wrong agent or model, a turn without usage
+    // is dropped from the turn count, a replaced usage is summed twice, or a user turn counts.
+    #[test]
+    fn usage_summary_groups_assistant_turns_by_agent_and_model() {
+        let mut f = fixture();
+        let claude = f
+            .store
+            .start_agent_session(
+                &f.thread.id,
+                &AgentId::ClaudeCode,
+                "opus",
+                PermissionMode::Default,
+                None,
+            )
+            .unwrap();
+        let qwen = f
+            .store
+            .start_agent_session(
+                &f.thread.id,
+                &AgentId::QwenCode,
+                "qwen3",
+                PermissionMode::Default,
+                None,
+            )
+            .unwrap();
+        let usage = |i, o, r, w| TokenUsage {
+            input_tokens: i,
+            output_tokens: o,
+            cache_read_tokens: r,
+            cache_write_tokens: w,
+        };
+        let a = f
+            .store
+            .start_turn(&f.thread.id, &claude, TurnRole::Assistant, None)
+            .unwrap();
+        let b = f
+            .store
+            .start_turn(&f.thread.id, &claude, TurnRole::Assistant, None)
+            .unwrap();
+        let c = f
+            .store
+            .start_turn(&f.thread.id, &qwen, TurnRole::Assistant, None)
+            .unwrap();
+        f.store
+            .record_usage(&a.id, &usage(1, 1, None, None))
+            .unwrap();
+        f.store
+            .record_usage(&a.id, &usage(10, 20, Some(3), Some(4)))
+            .unwrap();
+        // `b` has no usage; the user turn's usage must not count.
+        f.store
+            .record_usage(&c.id, &usage(7, 8, None, None))
+            .unwrap();
+        f.store
+            .record_usage(&f.turn.id, &usage(99, 99, None, None))
+            .unwrap();
+        let _ = b;
+        let rows = f.store.usage_summary().unwrap();
+        let expected = |agent, model: &str, turns, i, o, r, w| UsageRow {
+            agent,
+            model: model.into(),
+            turns,
+            input_tokens: i,
+            output_tokens: o,
+            cache_read_tokens: r,
+            cache_write_tokens: w,
+        };
+        assert_eq!(
+            rows,
+            vec![
+                expected(AgentId::ClaudeCode, "opus", 2, 10, 20, 3, 4),
+                expected(AgentId::QwenCode, "qwen3", 1, 7, 8, 0, 0),
+            ]
+        );
     }
 
     // Fails if events lose order across batches, the raw payload is dropped,

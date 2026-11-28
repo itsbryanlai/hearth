@@ -5,8 +5,8 @@ use crate::agents::{
 };
 use crate::api::{
     AgentStatus, EngineError, EventSink, HandoffDraft, InstalledAgent, Project, ReviewTurn,
-    ThreadEventPayload, ThreadModels, ThreadSnapshot, ThreadSummary, TurnSnapshot, WorktreeInfo,
-    WorktreeReview,
+    ThreadEventPayload, ThreadModels, ThreadSnapshot, ThreadSummary, TurnSnapshot, UsageRow,
+    WorktreeInfo, WorktreeReview,
 };
 use crate::coalesce::coalesce;
 use hearth_core::fsguard::FsGuard;
@@ -801,6 +801,11 @@ impl Engine {
         .await
         .ok()
         .flatten())
+    }
+
+    /// Tokens and turns per agent and model, computed from the local database.
+    pub fn usage_summary(&self) -> Result<Vec<UsageRow>, EngineError> {
+        Ok(lock(&self.inner.store).usage_summary()?)
     }
 
     /// The thread as stored; the agent's own replay is not used for display.
@@ -1940,7 +1945,15 @@ fn persist(
         .entry(thread.clone())
         .or_insert_with(|| store.thread_event_count(thread).unwrap_or(0).max(0) as u64 + 1);
     let events = match store.append_events(turn, &events) {
-        Ok(()) => events,
+        Ok(()) => {
+            for e in &events {
+                if let AgentEvent::Usage { usage } = &e.event {
+                    // Latest value for the turn replaces the earlier one.
+                    let _ = store.record_usage(turn, usage);
+                }
+            }
+            events
+        }
         Err(e) => vec![NewEvent {
             event: AgentEvent::Error {
                 message: format!("could not save events: {e}"),

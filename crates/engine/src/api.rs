@@ -1,6 +1,7 @@
 //! The engine's public types. Field names match `apps/desktop/src/ipc/contract.ts`.
 
 use hearth_core::store::StoreError;
+pub use hearth_core::store::UsageRow;
 use hearth_protocol::{AgentEvent, AgentId, ProjectId, ThreadId, TurnId, UserInput};
 use serde::Serialize;
 

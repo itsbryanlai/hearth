@@ -3,7 +3,8 @@ use hearth_engine::agents::claude::ClaudeAdapter;
 use hearth_engine::agents::qwen::{QwenAdapter, QwenLauncher};
 use hearth_engine::{
     DiffFile, Engine, EngineConfig, EventSink, FileDiff, HandoffDraft, InstalledAgent, Project,
-    ReviewTurn, ThreadEventPayload, ThreadModels, ThreadSnapshot, ThreadSummary, WorktreeReview,
+    ReviewTurn, ThreadEventPayload, ThreadModels, ThreadSnapshot, ThreadSummary, UsageRow,
+    WorktreeReview,
 };
 use hearth_protocol::{
     AgentId, ApprovalDecision, ApprovalId, ProjectId, ThreadId, TurnId, UserInput,
@@ -25,6 +26,15 @@ impl EventSink for TauriSink {
 
 fn show<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
+}
+
+#[tauri::command]
+async fn usage_summary(engine: State<'_, Engine>) -> Result<Vec<UsageRow>, String> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.usage_summary())
+        .await
+        .map_err(show)?
+        .map_err(show)
 }
 
 #[tauri::command]
@@ -350,6 +360,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             app_version,
             list_agents,
+            usage_summary,
             list_projects,
             add_project,
             list_threads,

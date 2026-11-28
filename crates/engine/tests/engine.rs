@@ -2066,8 +2066,8 @@ fn engine_both(w: &World, qwen: PathBuf) -> (Engine, mpsc::UnboundedReceiver<Thr
                     label: "Claude Code",
                     adapter: Arc::new(claude_adapter(
                         w,
-                        "simple",
-                        &fixtures.join("simple.jsonl"),
+                        "allow",
+                        &fixtures.join("approval-allowed.jsonl"),
                         None,
                     )),
                 },
@@ -2220,4 +2220,113 @@ async fn handoff_refuses_invalid_requests() {
             .unwrap();
         assert_eq!(after.id, before.id, "{case:?}");
     }
+}
+
+fn usage_chunk(input: u32, output: u32) -> serde_json::Value {
+    serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"usage-session","update":{
+        "sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hi"},
+        "_meta":{"usage":{"inputTokens":input,"outputTokens":output,"cachedReadTokens":3}}}}})
+}
+
+/// A qwen replay: one turn that reports usage once per entry of `chunks`.
+fn usage_fixture(w: &World, chunks: &[(u32, u32)]) -> PathBuf {
+    use serde_json::json;
+    let models =
+        json!({"currentModelId":"qwen-m","availableModels":[{"modelId":"qwen-m","name":"qwen-m"}]});
+    let mut frames = vec![
+        json!({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true}}}),
+        json!({"jsonrpc":"2.0","id":2,"result":{"sessionId":"usage-session","models":models}}),
+    ];
+    frames.extend(chunks.iter().map(|(i, o)| usage_chunk(*i, *o)));
+    frames.push(json!({"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}));
+    let path = w.project.join("usage.jsonl");
+    std::fs::write(
+        &path,
+        frames
+            .iter()
+            .map(|f| f.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+    path
+}
+
+// Fails if usage is not attributed to the turn's own agent and model, a turn
+// without usage drops out of the turn count, or a later usage event for the
+// same turn is added to the earlier one instead of replacing it.
+#[tokio::test]
+async fn usage_is_attributed_per_agent_and_model_and_latest_event_wins() {
+    let w = world();
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/claude");
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let engine = Engine::new(
+        EngineConfig {
+            db_path: Some(w.db.clone()),
+            home: w.home.clone(),
+            roots: vec![],
+            agents: vec![
+                Registration {
+                    id: AgentId::ClaudeCode,
+                    label: "Claude Code",
+                    adapter: Arc::new(claude_adapter(
+                        &w,
+                        "allow",
+                        &fixtures.join("approval-allowed.jsonl"),
+                        None,
+                    )),
+                },
+                Registration {
+                    id: AgentId::QwenCode,
+                    label: "Qwen Code",
+                    adapter: Arc::new(QwenAdapter(Arc::new(ReplayLauncher(usage_fixture(
+                        &w,
+                        &[(100, 5), (120, 40)],
+                    ))))),
+                },
+            ],
+        },
+        Arc::new(ChannelSink(tx)),
+    )
+    .unwrap();
+    engine.list_agents().await;
+    let project = engine.add_project(w.project.to_str().unwrap()).unwrap();
+    for agent in [AgentId::ClaudeCode, AgentId::QwenCode] {
+        let thread = engine
+            .create_thread(&project.id, agent.clone())
+            .await
+            .unwrap()
+            .id;
+        engine.send_message(&thread, say("Replay")).await.unwrap();
+        if agent == AgentId::ClaudeCode {
+            let approval = until(&mut rx, is_approval).await;
+            let AgentEvent::ApprovalRequest { request } = &approval.last().unwrap().event else {
+                unreachable!()
+            };
+            engine
+                .answer_approval(&thread, &request.id, ApprovalDecision::AllowOnce)
+                .await
+                .unwrap();
+        }
+        until(&mut rx, is_end).await;
+    }
+    let rows = engine.usage_summary().unwrap();
+    let by = |agent: AgentId| rows.iter().find(|r| r.agent == agent).unwrap();
+    let qwen = by(AgentId::QwenCode);
+    assert_eq!(
+        (
+            qwen.model.as_str(),
+            qwen.turns,
+            qwen.input_tokens,
+            qwen.output_tokens,
+            qwen.cache_read_tokens
+        ),
+        ("qwen-m", 1, 120, 40, 3)
+    );
+    let claude = by(AgentId::ClaudeCode);
+    assert_eq!(
+        (claude.model.as_str(), claude.turns),
+        ("claude-haiku-5-5", 1)
+    );
+    assert!(claude.input_tokens > 0 && claude.output_tokens > 0);
 }
