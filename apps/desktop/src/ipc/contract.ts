@@ -98,6 +98,9 @@ export interface Ipc {
   turnDiffFile(threadId: ThreadId, turnId: TurnId, fileId: string): Promise<FileDiff | null>;
   archiveThread(threadId: ThreadId): Promise<ThreadSummary>;
   restoreThread(threadId: ThreadId): Promise<ThreadSummary>;
+  cleanupPath(threadId: ThreadId): Promise<string | null>;
+  removeThreadWorktree(threadId: ThreadId): Promise<void>;
+  deleteThreadBranch(threadId: ThreadId): Promise<void>;
   listThreadModels(threadId: ThreadId): Promise<ThreadModels>;
   setThreadModel(threadId: ThreadId, modelId: string): Promise<ThreadSummary>;
   /** Builds an editable preamble locally; starts nothing. */

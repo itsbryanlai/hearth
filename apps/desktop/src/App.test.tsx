@@ -68,6 +68,9 @@ function fakeIpc(snapshot: ThreadSnapshot = { thread: THREAD, turns: [], lastSeq
     turnDiffFile: vi.fn<Ipc["turnDiffFile"]>(async () => null),
     archiveThread: vi.fn(async () => ({ ...THREAD, archived: true })),
     restoreThread: vi.fn(async () => THREAD),
+    cleanupPath: vi.fn<Ipc["cleanupPath"]>(async () => null),
+    removeThreadWorktree: vi.fn(async () => {}),
+    deleteThreadBranch: vi.fn(async () => {}),
     listThreadModels: vi.fn(async (): Promise<ThreadModels> => ({ choices: [], selected: null, current: null })),
     setThreadModel: vi.fn<Ipc["setThreadModel"]>(async () => THREAD),
     draftHandoff: vi.fn<Ipc["draftHandoff"]>(async (threadId, target) => ({ threadId, sourceAgent: "claude-code", targetAgent: target, text: `Draft for ${target}` })),
@@ -518,6 +521,22 @@ test("archive hides a thread while keeping its history available for restore", a
   expect(screen.getByText("It is a timing race in the session refresh.")).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "Restore" }));
   await vi.waitFor(() => expect((screen.getByLabelText("Message") as HTMLTextAreaElement).disabled).toBe(false));
+});
+
+// Fails if worktree removal starts before the user confirms the exact path.
+test("archived worktree cleanup requires explicit confirmation", async () => {
+  const { ipc } = fakeIpc();
+  ipc.cleanupPath.mockResolvedValue("/tmp/example/tree");
+  await openThread(ipc);
+  fireEvent.click(screen.getByRole("button", { name: "Archive" }));
+  await screen.findByRole("button", { name: "Worktree cleanup" });
+  fireEvent.click(screen.getByRole("button", { name: "Worktree cleanup" }));
+  await screen.findByText("Worktree: /tmp/example/tree");
+  fireEvent.click(screen.getByRole("button", { name: "Remove worktree" }));
+  expect(screen.getByText("Remove the clean worktree at /tmp/example/tree?")).toBeTruthy();
+  expect(ipc.removeThreadWorktree).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: "Confirm removal" }));
+  await vi.waitFor(() => expect(ipc.removeThreadWorktree).toHaveBeenCalledWith("th"));
 });
 
 // Fails if pending archive accepts a message or a late history load revives the thread.

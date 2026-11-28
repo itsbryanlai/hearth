@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-delete-thread-branch"
+description = "Enables the delete_thread_branch command without any pre-configured scope."
+commands.allow = ["delete_thread_branch"]
+
+[[permission]]
+identifier = "deny-delete-thread-branch"
+description = "Denies the delete_thread_branch command without any pre-configured scope."
+commands.deny = ["delete_thread_branch"]

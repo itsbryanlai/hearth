@@ -160,8 +160,44 @@ async fn archive_thread(
 }
 
 #[tauri::command]
-fn restore_thread(engine: State<'_, Engine>, thread_id: ThreadId) -> Result<ThreadSummary, String> {
-    engine.restore_thread(&thread_id).map_err(show)
+async fn restore_thread(
+    engine: State<'_, Engine>,
+    thread_id: ThreadId,
+) -> Result<ThreadSummary, String> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.restore_thread(&thread_id))
+        .await
+        .map_err(show)?
+        .map_err(show)
+}
+
+#[tauri::command]
+fn cleanup_path(engine: State<'_, Engine>, thread_id: ThreadId) -> Result<Option<String>, String> {
+    engine.cleanup_path(&thread_id).map_err(show)
+}
+
+#[tauri::command]
+async fn remove_thread_worktree(
+    engine: State<'_, Engine>,
+    thread_id: ThreadId,
+) -> Result<(), String> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.remove_thread_worktree(&thread_id))
+        .await
+        .map_err(show)?
+        .map_err(show)
+}
+
+#[tauri::command]
+async fn delete_thread_branch(
+    engine: State<'_, Engine>,
+    thread_id: ThreadId,
+) -> Result<(), String> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.delete_thread_branch(&thread_id))
+        .await
+        .map_err(show)?
+        .map_err(show)
 }
 
 #[tauri::command]
@@ -329,6 +365,9 @@ fn main() {
             turn_diff_file,
             archive_thread,
             restore_thread,
+            cleanup_path,
+            remove_thread_worktree,
+            delete_thread_branch,
             list_thread_models,
             set_thread_model,
             draft_handoff,

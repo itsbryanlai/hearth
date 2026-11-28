@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cleanup-path"
+description = "Enables the cleanup_path command without any pre-configured scope."
+commands.allow = ["cleanup_path"]
+
+[[permission]]
+identifier = "deny-cleanup-path"
+description = "Denies the cleanup_path command without any pre-configured scope."
+commands.deny = ["cleanup_path"]

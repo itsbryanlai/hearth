@@ -141,6 +141,9 @@ export function createMockIpc(options: Options = {}): Ipc {
     },
     listThreads: async (projectId) => threads.filter((t) => t.projectId === projectId),
     worktreeInfo: async () => ({ isGit: false, base: null, reason: null }),
+    cleanupPath: async () => null,
+    removeThreadWorktree: async () => { throw new Error("This thread has no worktree."); },
+    deleteThreadBranch: async () => { throw new Error("This thread has no worktree."); },
     async createThread(projectId, agent) {
       const thread: ThreadSummary = {
         id: id("th"),
