@@ -1732,3 +1732,84 @@ async fn archive_refuses_a_running_turn() {
     assert!(engine.archive_thread(&thread).await.is_err());
     assert!(!engine.load_thread(&thread).unwrap().thread.archived);
 }
+
+// Fails if the draft loses user input, leaks private data, or changes its source.
+#[tokio::test]
+async fn handoff_draft_preserves_input_and_reports_observed_events_without_mutation() {
+    use hearth_core::store::{NewEvent, Store};
+    use hearth_protocol::FileEditKind;
+
+    let w = world();
+    let (engine, mut rx) = engine(&w, fixture("acp-approval-allowed.jsonl"));
+    let thread = thread_of(&engine, &w).await;
+    let empty = engine.draft_handoff(&thread).unwrap();
+    assert!(empty.1.contains("No conversation recorded."));
+    let input = "First line\nKeep every detail, including this one.";
+    engine.send_message(&thread, say(input)).await.unwrap();
+    let approval = until(&mut rx, is_approval).await;
+    let AgentEvent::ApprovalRequest { request } = &approval.last().unwrap().event else {
+        unreachable!()
+    };
+    engine
+        .answer_approval(&thread, &request.id, ApprovalDecision::AllowOnce)
+        .await
+        .unwrap();
+    until(&mut rx, is_end).await;
+    let turn = engine.load_thread(&thread).unwrap().turns[0]
+        .turn_id
+        .clone();
+    let mut store = Store::open(&w.db).unwrap();
+    let events = vec![
+        AgentEvent::ReasoningDelta {
+            text: "private thought marker".into(),
+        },
+        AgentEvent::FileEdit {
+            tool_call_id: "edit".into(),
+            path: "src/example.rs".into(),
+            edit_kind: FileEditKind::Modify,
+        },
+        AgentEvent::CommandRun {
+            tool_call_id: "command".into(),
+            command: "cargo test".into(),
+            exit_code: Some(1),
+        },
+        AgentEvent::CommandRun {
+            tool_call_id: "pending".into(),
+            command: "cargo check".into(),
+            exit_code: None,
+        },
+    ];
+    store
+        .append_events(
+            &turn,
+            &events
+                .into_iter()
+                .map(|event| NewEvent {
+                    event,
+                    raw: Some(serde_json::json!({"secret": "raw wire marker"})),
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    let before = engine.load_thread(&thread).unwrap();
+    let sessions_before = store.latest_agent_session(&thread).unwrap().unwrap().id;
+    let threads_before = engine.list_threads(&before.thread.project_id).unwrap();
+    let (source, draft) = engine.draft_handoff(&thread).unwrap();
+    assert_eq!(source, thread);
+    assert!(draft.contains(input));
+    assert!(draft.contains("done — appended"));
+    assert!(draft.contains("src/example.rs"));
+    assert!(draft.contains("cargo test (exit code 1)"));
+    assert!(draft.contains("cargo check (exit status not recorded)"));
+    assert!(!draft.contains("private thought marker"));
+    assert!(!draft.contains("raw wire marker"));
+    assert_eq!(engine.load_thread(&thread).unwrap(), before);
+    assert_eq!(
+        engine.list_threads(&before.thread.project_id).unwrap(),
+        threads_before
+    );
+    assert_eq!(
+        store.latest_agent_session(&thread).unwrap().unwrap().id,
+        sessions_before
+    );
+}

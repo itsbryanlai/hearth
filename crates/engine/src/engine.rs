@@ -858,6 +858,90 @@ impl Engine {
         thread_summary(&store, &store.get_thread(id)?)
     }
 
+    /// Prepare an editable hand-off from the stored, normalized transcript.
+    pub fn draft_handoff(&self, id: &ThreadId) -> Result<(ThreadId, String), EngineError> {
+        let snapshot = self.load_thread(id)?;
+        let messages: Vec<&str> = snapshot
+            .turns
+            .iter()
+            .filter_map(|turn| {
+                let UserInput::Text { text } = &turn.input;
+                (!text.is_empty()).then_some(text.as_str())
+            })
+            .collect();
+        let mut draft = format!(
+            "Original goal:\n{}\n\nLatest user direction:\n{}\n\nConversation:\n",
+            messages
+                .first()
+                .copied()
+                .unwrap_or("No user message recorded."),
+            messages
+                .last()
+                .copied()
+                .unwrap_or("No user message recorded.")
+        );
+        if snapshot.turns.is_empty() {
+            draft.push_str("No conversation recorded.\n");
+        }
+        for turn in &snapshot.turns {
+            let UserInput::Text { text } = &turn.input;
+            if !text.is_empty() {
+                draft.push_str(&format!("\nUser:\n{text}\n"));
+            }
+            let mut prose = String::new();
+            for event in &turn.events {
+                if let AgentEvent::TextDelta { text } = event {
+                    prose.push_str(text);
+                }
+            }
+            let prose = prose.trim();
+            if !prose.is_empty() {
+                // Keep the first two sentences, capped at a character boundary.
+                let end = prose
+                    .char_indices()
+                    .filter(|(_, c)| matches!(c, '.' | '!' | '?'))
+                    .nth(1)
+                    .map(|(i, c)| i + c.len_utf8())
+                    .unwrap_or(prose.len());
+                let excerpt = &prose[..end];
+                let cutoff = excerpt
+                    .char_indices()
+                    .nth(500)
+                    .map(|(i, _)| i)
+                    .unwrap_or(excerpt.len());
+                draft.push_str(&format!(
+                    "Assistant: {}{}\n",
+                    &excerpt[..cutoff],
+                    if cutoff < prose.len() { "…" } else { "" }
+                ));
+            }
+            if !turn
+                .events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::TurnEnd { .. }))
+            {
+                draft.push_str("Assistant response incomplete: no turn end recorded.\n");
+            }
+            for event in &turn.events {
+                match event {
+                    AgentEvent::FileEdit { path, .. } => {
+                        draft.push_str(&format!("File edited: {path}\n"))
+                    }
+                    AgentEvent::CommandRun {
+                        command, exit_code, ..
+                    } => {
+                        let status = exit_code
+                            .map(|code| format!("exit code {code}"))
+                            .unwrap_or_else(|| "exit status not recorded".into());
+                        draft.push_str(&format!("Command: {command} ({status})\n"));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok((snapshot.thread.id, draft))
+    }
+
     pub async fn list_thread_models(&self, thread: &ThreadId) -> Result<ThreadModels, EngineError> {
         let _work = self.reserve_models(thread)?;
         let (thread, session, selected) = self.thread_session(thread)?;
