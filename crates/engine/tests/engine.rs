@@ -1676,3 +1676,59 @@ async fn review_file_replaced_by_directory_reads_each_file_separately() {
         assert_eq!(rows[0].text, text);
     }
 }
+
+// Fails if archive loses a checkout or transcript, or permits sending before restore.
+#[tokio::test]
+async fn archived_thread_reopens_and_restores_without_losing_work() {
+    let w = world();
+    init_git(&w);
+    let (first, mut rx) = engine(&w, fixture("acp-cancel.jsonl"));
+    let project = first.add_project(w.project.to_str().unwrap()).unwrap();
+    let thread = first
+        .create_thread_in(&project.id, AgentId::QwenCode, Some("HEAD".into()))
+        .await
+        .unwrap();
+    let saved = hearth_core::store::Store::open(&w.db)
+        .unwrap()
+        .get_thread(&thread.id)
+        .unwrap();
+    first
+        .send_message(&thread.id, say("keep this"))
+        .await
+        .unwrap();
+    first.cancel_turn(&thread.id).await.unwrap();
+    until(&mut rx, is_end).await;
+    assert!(first.archive_thread(&thread.id).await.unwrap().archived);
+    drop(first);
+    let (reopened, _rx) = engine(&w, fixture("acp-cancel.jsonl"));
+    let snapshot = reopened.load_thread(&thread.id).unwrap();
+    assert!(snapshot.thread.archived);
+    assert_eq!(snapshot.thread.branch, thread.branch);
+    assert_eq!(snapshot.turns[0].input, say("keep this"));
+    assert!(Path::new(&saved.cwd).join("tracked").exists());
+    assert!(reopened.list_threads(&project.id).unwrap()[0].archived);
+    assert!(
+        reopened
+            .send_message(&thread.id, say("blocked"))
+            .await
+            .is_err()
+    );
+    assert!(!reopened.restore_thread(&thread.id).unwrap().archived);
+    assert!(!reopened.restore_thread(&thread.id).unwrap().archived);
+    reopened
+        .send_message(&thread.id, say("restored"))
+        .await
+        .unwrap();
+}
+
+// Fails if archive can interrupt a running turn or pending approval.
+#[tokio::test]
+async fn archive_refuses_a_running_turn() {
+    let w = world();
+    let (engine, mut rx) = engine(&w, fixture("acp-approval-allowed.jsonl"));
+    let thread = thread_of(&engine, &w).await;
+    engine.send_message(&thread, say("go")).await.unwrap();
+    until(&mut rx, is_approval).await;
+    assert!(engine.archive_thread(&thread).await.is_err());
+    assert!(!engine.load_thread(&thread).unwrap().thread.archived);
+}

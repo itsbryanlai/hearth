@@ -23,6 +23,8 @@ export function createTauriIpc(): Ipc {
     releaseWorktreeReview: (threadId, reviewId) => invoke("release_worktree_review", { threadId, reviewId }),
     turnDiffFiles: (threadId, turnId) => invoke("turn_diff_files", { threadId, turnId }),
     turnDiffFile: (threadId, turnId, fileId) => invoke("turn_diff_file", { threadId, turnId, fileId }),
+    archiveThread: (threadId) => invoke("archive_thread", { threadId }),
+    restoreThread: (threadId) => invoke("restore_thread", { threadId }),
     listThreadModels: (threadId) => invoke("list_thread_models", { threadId }),
     setThreadModel: (threadId, modelId) => invoke("set_thread_model", { threadId, modelId }),
     sendMessage: (threadId, input) =>

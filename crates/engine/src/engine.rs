@@ -172,6 +172,7 @@ fn thread_summary(store: &Store, t: &store::Thread) -> Result<ThreadSummary, Eng
             .map_or(AgentId::QwenCode, |s| s.agent.clone()),
         model: session.map(|s| s.model).unwrap_or_default(),
         branch: t.branch.clone(),
+        archived: t.status == ThreadStatus::Archived,
     })
 }
 
@@ -302,7 +303,6 @@ impl Engine {
         store
             .list_threads(project)?
             .iter()
-            .filter(|t| t.status != ThreadStatus::Archived)
             .map(|t| thread_summary(&store, t))
             .collect()
     }
@@ -445,6 +445,7 @@ impl Engine {
                     agent: agent.clone(),
                     model: String::new(),
                     branch: thread.branch,
+                    archived: false,
                 })
         };
         match result {
@@ -835,6 +836,28 @@ impl Engine {
         })
     }
 
+    pub async fn archive_thread(&self, id: &ThreadId) -> Result<ThreadSummary, EngineError> {
+        let _work = self.reserve_models(id)?;
+        let summary = {
+            let mut store = lock(&self.inner.store);
+            store.get_thread(id)?;
+            store.update_thread_status(id, ThreadStatus::Archived)?;
+            thread_summary(&store, &store.get_thread(id)?)?
+        };
+        self.inner.sessions.lock().await.remove(id);
+        Ok(summary)
+    }
+
+    pub fn restore_thread(&self, id: &ThreadId) -> Result<ThreadSummary, EngineError> {
+        let _work = self.reserve_models(id)?;
+        let mut store = lock(&self.inner.store);
+        let thread = store.get_thread(id)?;
+        if thread.status == ThreadStatus::Archived {
+            store.update_thread_status(id, ThreadStatus::Idle)?;
+        }
+        thread_summary(&store, &store.get_thread(id)?)
+    }
+
     pub async fn list_thread_models(&self, thread: &ThreadId) -> Result<ThreadModels, EngineError> {
         let _work = self.reserve_models(thread)?;
         let (thread, session, selected) = self.thread_session(thread)?;
@@ -895,6 +918,9 @@ impl Engine {
     ) -> Result<(store::Thread, store::AgentSession, Option<String>), EngineError> {
         let store = lock(&self.inner.store);
         let thread = store.get_thread(id)?;
+        if thread.status == ThreadStatus::Archived {
+            return Err("Restore this thread before sending or changing models.".into());
+        }
         let session = store
             .latest_agent_session(id)?
             .ok_or("thread has no agent session")?;
