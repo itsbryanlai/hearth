@@ -25,7 +25,8 @@ use tokio::{
 };
 use wire::{ControlResponse, Envelope};
 
-const SUPPORTED_VERSION: &str = "2.1.328";
+/// Versions verified with a signed-in real run (event, approval, resume, cancel).
+const SUPPORTED_VERSIONS: &[&str] = &["2.1.328", "2.1.332"];
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 const TURN_BUFFER: usize = 1024;
 
@@ -270,7 +271,7 @@ impl ClaudeProcess {
         if !output.status.success() {
             return Err(Error::Launch);
         }
-        if version != SUPPORTED_VERSION {
+        if !SUPPORTED_VERSIONS.contains(&version) {
             return Err(Error::UnsupportedVersion(version.to_owned()));
         }
         Ok(version.to_owned())
