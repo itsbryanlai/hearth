@@ -258,5 +258,19 @@ pub fn delete_worktree_branch(
         return Err("Branch is used by another worktree.".into());
     }
     git(&project, home, &["update-ref", "-d", &reference, tip])?;
+    // Another checkout can switch to the branch while its ref is locked for deletion and leave
+    // that worktree on a missing ref. Recreate the ref (create-only) and keep the branch.
+    if git(&project, home, &["worktree", "list", "--porcelain", "-z"])?
+        .split('\0')
+        .any(|field| field == occupied)
+    {
+        let zero = "0".repeat(tip.len());
+        return match git(&project, home, &["update-ref", &reference, tip, &zero]) {
+            Ok(_) => Err("Branch was in use by another worktree and was kept.".into()),
+            Err(error) => Err(format!(
+                "Branch {branch} was checked out elsewhere while it was deleted and could not be restored ({error}). Recreate it with: git branch {branch} {tip}"
+            )),
+        };
+    }
     Ok(())
 }

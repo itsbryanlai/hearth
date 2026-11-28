@@ -1861,6 +1861,61 @@ async fn cleanup_refuses_dirty_worktrees_and_unmerged_branches() {
     );
 }
 
+// Fails if branch deletion leaves an external worktree on a deleted branch.
+#[tokio::test]
+async fn branch_deletion_restores_a_branch_an_external_checkout_took_meanwhile() {
+    let w = world();
+    init_git(&w);
+    let (engine, _) = engine(&w, fixture("acp-cancel.jsonl"));
+    let project = engine.add_project(w.project.to_str().unwrap()).unwrap();
+    let thread = engine
+        .create_thread_in(&project.id, AgentId::QwenCode, Some("HEAD".into()))
+        .await
+        .unwrap();
+    let branch = thread.branch.clone().unwrap();
+    engine.archive_thread(&thread.id).await.unwrap();
+    engine.remove_thread_worktree(&thread.id).unwrap();
+    let tip = git_in(&w.project, &["rev-parse", &branch]);
+    let linked = w.project.parent().unwrap().join("linked-checkout");
+    git_in(
+        &w.project,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            linked.to_str().unwrap(),
+        ],
+    );
+    let hooks = w.home.join("hooks");
+    std::fs::create_dir(&hooks).unwrap();
+    let done = w.home.join("hook-done");
+    let hook = hooks.join("reference-transaction");
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\n[ \"$1\" = prepared ] || exit 0\n[ -e '{done}' ] && exit 0\ngrep -q 'refs/heads/{branch}' || exit 0\n: > '{done}'\ngit -C '{linked}' switch -q '{branch}' || exit 1\n",
+            done = done.display(),
+            linked = linked.display(),
+            branch = branch,
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(
+        w.home.join(".gitconfig"),
+        format!("[core]\n hooksPath = {}\n", hooks.display()),
+    )
+    .unwrap();
+    assert!(engine.delete_thread_branch(&thread.id).is_err());
+    assert!(done.exists());
+    assert_eq!(git_in(&w.project, &["rev-parse", &branch]), tip);
+    assert_eq!(git_in(&linked, &["rev-parse", "HEAD"]), tip);
+    assert!(git_in(&linked, &["status", "--porcelain"]).is_empty());
+    assert!(engine.delete_thread_branch(&thread.id).is_err());
+    assert_eq!(git_in(&w.project, &["rev-parse", &branch]), tip);
+}
+
 // Fails if archive can interrupt a running turn or pending approval.
 #[tokio::test]
 async fn archive_refuses_a_running_turn() {
