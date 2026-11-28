@@ -66,9 +66,10 @@ async fn create_thread(
     project_id: ProjectId,
     agent: AgentId,
     base: Option<String>,
+    parent: Option<String>,
 ) -> Result<ThreadSummary, String> {
     engine
-        .create_thread_in(&project_id, agent, base)
+        .create_thread_in_parent(&project_id, agent, base, parent)
         .await
         .map_err(show)
 }

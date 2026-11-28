@@ -72,4 +72,5 @@ pub(super) const MIGRATIONS: &[&str] = &[
     ",
     // 2: the user's message on a user turn (a UserInput as JSON).
     "ALTER TABLE turns ADD COLUMN input_json TEXT;",
+    "ALTER TABLE threads ADD COLUMN worktree_parent TEXT;",
 ];

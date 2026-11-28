@@ -157,8 +157,12 @@ impl Engine {
             for thread in store.list_threads(&project.id)? {
                 if let Some(path) = thread.worktree_path.as_deref()
                     && thread.cwd == path
-                    && let Ok(path) =
-                        hearth_core::git::validate(&project_path, &config.home, Path::new(path))
+                    && let Ok(path) = hearth_core::git::validate_in(
+                        &project_path,
+                        &config.home,
+                        Path::new(path),
+                        thread.worktree_parent.as_deref().map(Path::new),
+                    )
                 {
                     roots.push(path);
                 }
@@ -295,6 +299,17 @@ impl Engine {
         agent: AgentId,
         base: Option<String>,
     ) -> Result<ThreadSummary, EngineError> {
+        self.create_thread_in_parent(project, agent, base, None)
+            .await
+    }
+
+    pub async fn create_thread_in_parent(
+        &self,
+        project: &ProjectId,
+        agent: AgentId,
+        base: Option<String>,
+        parent: Option<String>,
+    ) -> Result<ThreadSummary, EngineError> {
         let registered = self.registration(&agent)?;
         match registered.adapter.availability().await {
             AgentStatus::Ready => {}
@@ -319,11 +334,19 @@ impl Engine {
         let worktree = if let Some(base) = base {
             let path = PathBuf::from(&project.path);
             let home = self.inner.home.clone();
+            let selected = parent.clone();
             Some(
-                tokio::task::spawn_blocking(move || hearth_core::git::create(&path, &home, &base))
-                    .await
-                    .map_err(|e| EngineError(e.to_string()))?
-                    .map_err(EngineError)?,
+                tokio::task::spawn_blocking(move || {
+                    hearth_core::git::create_in(
+                        &path,
+                        &home,
+                        &base,
+                        selected.as_deref().map(Path::new),
+                    )
+                })
+                .await
+                .map_err(|e| EngineError(e.to_string()))?
+                .map_err(EngineError)?,
             )
         } else {
             None
@@ -341,6 +364,7 @@ impl Engine {
                         title: NEW_THREAD_TITLE,
                         cwd: &cwd,
                         worktree_path: worktree.as_ref().map(|_| cwd.as_str()),
+                        worktree_parent: worktree.as_ref().and(parent.as_deref()),
                         branch: worktree.as_ref().map(|w| w.branch.as_str()),
                         base_ref: worktree.as_ref().map(|w| w.base.as_str()),
                     },
@@ -362,8 +386,14 @@ impl Engine {
                     let project_path = PathBuf::from(&project.path);
                     let path = worktree.path.clone();
                     let home = self.inner.home.clone();
+                    let selected = parent.clone();
                     let root = tokio::task::spawn_blocking(move || {
-                        hearth_core::git::validate(&project_path, &home, &path)
+                        hearth_core::git::validate_in(
+                            &project_path,
+                            &home,
+                            &path,
+                            selected.as_deref().map(Path::new),
+                        )
                     })
                     .await
                     .map_err(|e| EngineError(e.to_string()))?

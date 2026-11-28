@@ -113,17 +113,20 @@ impl FsGuard {
     pub fn worktree_component(
         &self,
         project: &Path,
+        top: &Path,
         path: &Path,
         create: bool,
         absent: bool,
     ) -> Result<(), String> {
         let project = self.try_check(project).map_err(|e| e.to_string())?;
         let project = project.as_path();
-        let top = project
-            .parent()
-            .ok_or("Project has no parent")?
-            .join(".hearth-worktrees");
+        if !top.is_absolute() || top.starts_with(project) || self.in_denylist(top) {
+            return Err("Invalid worktree parent".into());
+        }
         let parent = top.join(project.file_name().ok_or("Project has no name")?);
+        if parent.starts_with(project) {
+            return Err("Worktree destination is inside the project".into());
+        }
         if path != top && path != parent && path.parent() != Some(parent.as_path()) {
             return Err("Invalid worktree destination".into());
         }
@@ -132,6 +135,9 @@ impl FsGuard {
             .ok_or("Invalid destination")?
             .canonicalize()
             .map_err(|e| e.to_string())?;
+        if canonical_parent != path.parent().ok_or("Invalid destination")? {
+            return Err("Redirected worktree path refused".into());
+        }
         if self.in_denylist(path) || self.in_denylist(&canonical_parent) {
             return Err("Worktree destination is protected".into());
         }
@@ -151,7 +157,7 @@ impl FsGuard {
             Err(e) => return Err(e.to_string()),
         }
         let canonical = path.canonicalize().map_err(|e| e.to_string())?;
-        if self.in_denylist(&canonical) {
+        if canonical != path || self.in_denylist(&canonical) {
             return Err("Worktree destination is protected".into());
         }
         Ok(())

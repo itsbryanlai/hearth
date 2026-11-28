@@ -79,6 +79,7 @@ pub struct NewThread<'a> {
     pub title: &'a str,
     pub cwd: &'a str,
     pub worktree_path: Option<&'a str>,
+    pub worktree_parent: Option<&'a str>,
     pub branch: Option<&'a str>,
     pub base_ref: Option<&'a str>,
 }
@@ -90,6 +91,7 @@ pub struct Thread {
     pub title: String,
     pub cwd: String,
     pub worktree_path: Option<String>,
+    pub worktree_parent: Option<String>,
     pub branch: Option<String>,
     pub base_ref: Option<String>,
     pub status: ThreadStatus,
@@ -250,8 +252,8 @@ impl Store {
         let id = ThreadId::new();
         self.conn.execute(
             &format!(
-                "INSERT INTO threads (id, project_id, title, cwd, worktree_path, branch, base_ref, status, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, {NOW_MS})"
+                "INSERT INTO threads (id, project_id, title, cwd, worktree_path, branch, base_ref, status, worktree_parent, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, {NOW_MS})"
             ),
             params![
                 id.0,
@@ -261,7 +263,8 @@ impl Store {
                 new.worktree_path,
                 new.branch,
                 new.base_ref,
-                to_text(&ThreadStatus::Idle)?
+                to_text(&ThreadStatus::Idle)?,
+                new.worktree_parent
             ],
         )?;
         self.get_thread(&id)
@@ -279,8 +282,8 @@ impl Store {
         let tx = self.conn.transaction()?;
         tx.execute(
             &format!(
-                "INSERT INTO threads (id, project_id, title, cwd, worktree_path, branch, base_ref, status, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, {NOW_MS})"
+                "INSERT INTO threads (id, project_id, title, cwd, worktree_path, branch, base_ref, status, worktree_parent, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, {NOW_MS})"
             ),
             params![
                 id.0,
@@ -290,7 +293,8 @@ impl Store {
                 new.worktree_path,
                 new.branch,
                 new.base_ref,
-                to_text(&ThreadStatus::Idle)?
+                to_text(&ThreadStatus::Idle)?,
+                new.worktree_parent
             ],
         )?;
         tx.execute(
@@ -774,8 +778,8 @@ fn write_session(
     Ok(())
 }
 
-const THREAD_SELECT: &str = "SELECT id, project_id, title, cwd, worktree_path, branch, base_ref, status, created_at, archived_at FROM threads";
-const THREAD_SELECT_BY_ID: &str = "SELECT id, project_id, title, cwd, worktree_path, branch, base_ref, status, created_at, archived_at FROM threads WHERE id = ?1";
+const THREAD_SELECT: &str = "SELECT id, project_id, title, cwd, worktree_path, branch, base_ref, status, created_at, archived_at, worktree_parent FROM threads";
+const THREAD_SELECT_BY_ID: &str = "SELECT id, project_id, title, cwd, worktree_path, branch, base_ref, status, created_at, archived_at, worktree_parent FROM threads WHERE id = ?1";
 const TURN_SELECT: &str = "SELECT id, thread_id, seq, agent_session_id, role, created_at, tree_snapshot, input_json FROM turns";
 const TURN_SELECT_BY_ID: &str = "SELECT id, thread_id, seq, agent_session_id, role, created_at, tree_snapshot, input_json FROM turns WHERE id = ?1";
 
@@ -792,6 +796,7 @@ fn thread_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Thread> {
         status: from_text(&status).map_err(json_err)?,
         created_at: r.get(8)?,
         archived_at: r.get(9)?,
+        worktree_parent: r.get(10)?,
     })
 }
 
