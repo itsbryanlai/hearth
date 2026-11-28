@@ -1,5 +1,5 @@
-import { useRef, useState } from "react";
-import type { AgentStatus } from "../ipc/contract";
+import { useEffect, useRef, useState } from "react";
+import type { AgentStatus, UsageRow } from "../ipc/contract";
 import { useApp } from "../state/context";
 
 function availability(status: AgentStatus): string {
@@ -11,6 +11,35 @@ function availability(status: AgentStatus): string {
     case "unsupported":
       return ` (unsupported version ${status.version})`;
   }
+}
+
+function UsagePanel({ onClose }: { onClose: () => void }) {
+  const usageSummary = useApp((s) => s.usageSummary);
+  const [rows, setRows] = useState<UsageRow[] | null>(null);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    let current = true;
+    void usageSummary().then((value) => { if (current) setRows(value); }, (e: unknown) => { if (current) setError(String(e)); });
+    return () => { current = false; };
+  }, [usageSummary]);
+  return (
+    <section className="usage" aria-label="Usage">
+      <p>Computed from this Mac's Hearth data. Never sent anywhere.</p>
+      {error ? <p role="alert">{error}</p> : rows === null ? <p>Loading…</p> : rows.length === 0 ? <p>No usage yet.</p> : (
+        <table>
+          <thead><tr><th>Agent</th><th>Model</th><th>Turns</th><th>Input</th><th>Output</th><th>Cache read</th><th>Cache write</th></tr></thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr key={`${r.agent}/${r.model}`}>
+                <td>{r.agent}</td><td>{r.model}</td><td>{r.turns}</td><td>{r.inputTokens}</td><td>{r.outputTokens}</td><td>{r.cacheReadTokens}</td><td>{r.cacheWriteTokens}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+      <button type="button" className="quiet" onClick={onClose}>Close usage</button>
+    </section>
+  );
 }
 
 export function Sidebar() {
@@ -37,6 +66,7 @@ export function Sidebar() {
   const [adding, setAdding] = useState(false);
   const [path, setPath] = useState("");
   const [showArchived, setShowArchived] = useState(false);
+  const [showUsage, setShowUsage] = useState(false);
 
   return (
     <nav className="sidebar" aria-label="Projects">
@@ -155,6 +185,13 @@ export function Sidebar() {
       ) : (
         <button type="button" className="quiet add" onClick={() => setAdding(true)}>
           + Project
+        </button>
+      )}
+      {showUsage ? (
+        <UsagePanel onClose={() => setShowUsage(false)} />
+      ) : (
+        <button type="button" className="quiet add" onClick={() => setShowUsage(true)}>
+          Usage
         </button>
       )}
     </nav>

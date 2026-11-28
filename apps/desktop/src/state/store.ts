@@ -36,6 +36,7 @@ export type AppState = {
   archivePending: Record<string, boolean>;
   activeThreadId: string | null;
   error: string | null;
+  usageSummary: Ipc["usageSummary"];
   reviewTurns: Ipc["reviewTurns"];
   startWorktreeReview: Ipc["startWorktreeReview"];
   worktreeDiffFiles: Ipc["worktreeDiffFiles"];
@@ -203,6 +204,7 @@ export function createAppStore(ipc: Ipc, options: Options = {}): AppStore {
           fail(e);
         }
       },
+      usageSummary: () => ipc.usageSummary(),
       reviewTurns: (threadId) => ipc.reviewTurns(threadId),
       startWorktreeReview: (threadId) => {
         const previous = reviewStarts.get(threadId) ?? Promise.resolve();

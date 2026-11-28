@@ -53,6 +53,7 @@ function fakeIpc(snapshot: ThreadSnapshot = { thread: THREAD, turns: [], lastSeq
   let emit: (p: ThreadEventPayload) => void = () => {};
   const ipc = {
     listAgents: vi.fn(async (): Promise<InstalledAgent[]> => [{ ...CLAUDE, remembersApprovals: true }]),
+    usageSummary: vi.fn<Ipc["usageSummary"]>(async () => []),
     listProjects: vi.fn(async () => [{ id: "p", name: "proj", path: "/work/proj" }]),
     addProject: vi.fn(),
     listThreads: vi.fn<Ipc["listThreads"]>(async () => [THREAD]),
@@ -587,4 +588,20 @@ test("hand-off Cancel closes the panel without starting anything", async () => {
   expect(screen.queryByLabelText("Hand-off message")).toBeNull();
   expect(ipc.startHandoff).not.toHaveBeenCalled();
   expect(ipc.sendMessage).not.toHaveBeenCalled();
+});
+
+// Fails if the usage panel does not show the backend's rows, or does not refetch each time it opens.
+test("usage panel lists the backend rows and refreshes on every open", async () => {
+  const { ipc } = fakeIpc();
+  ipc.usageSummary.mockResolvedValueOnce([
+    { agent: "claude-code", model: "opus", turns: 3, inputTokens: 1200, outputTokens: 340, cacheReadTokens: 50, cacheWriteTokens: 7 },
+  ]);
+  render(<App store={createAppStore(ipc, { raf: frames().raf })} />);
+  fireEvent.click(await screen.findByRole("button", { name: "Usage" }));
+  const row = (await screen.findByText("opus")).closest("tr")!;
+  expect(within(row).getAllByRole("cell").map((c) => c.textContent)).toEqual(["claude-code", "opus", "3", "1200", "340", "50", "7"]);
+  expect(screen.getByText("Computed from this Mac's Hearth data. Never sent anywhere.")).toBeDefined();
+  fireEvent.click(screen.getByRole("button", { name: "Close usage" }));
+  fireEvent.click(screen.getByRole("button", { name: "Usage" }));
+  await vi.waitFor(() => expect(ipc.usageSummary).toHaveBeenCalledTimes(2));
 });

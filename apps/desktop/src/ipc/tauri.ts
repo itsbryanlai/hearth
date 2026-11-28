@@ -9,6 +9,7 @@ import {
 export function createTauriIpc(): Ipc {
   return {
     listAgents: () => invoke("list_agents"),
+    usageSummary: () => invoke("usage_summary"),
     listProjects: () => invoke("list_projects"),
     addProject: (path) => invoke("add_project", { path }),
     listThreads: (projectId) => invoke("list_threads", { projectId }),

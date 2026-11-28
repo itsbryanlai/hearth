@@ -71,6 +71,15 @@ export type ThreadEventPayload = {
 
 export const THREAD_EVENT_CHANNEL = "thread-event";
 
+export type UsageRow = {
+  agent: AgentId;
+  model: string;
+  turns: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+};
 export type ReviewTurn = { turnId: TurnId; label: string; available: boolean };
 export type WorktreeReview = { id: string; files: DiffFile[] };
 export type DiffFile = { id: string; path: string; oldPath: string | null; status: string };
@@ -83,6 +92,8 @@ export type FileDiff = { binary: boolean; hunks: { header: string; rows: DiffRow
  */
 export interface Ipc {
   listAgents(): Promise<InstalledAgent[]>;
+  /** Tokens and turns per agent and model, computed from the local database. */
+  usageSummary(): Promise<UsageRow[]>;
   listProjects(): Promise<Project[]>;
   addProject(path: string): Promise<Project>;
   listThreads(projectId: ProjectId): Promise<ThreadSummary[]>;

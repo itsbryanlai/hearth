@@ -3,6 +3,7 @@ fn main() {
         tauri_build::AppManifest::new().commands(&[
             "app_version",
             "list_agents",
+            "usage_summary",
             "list_projects",
             "add_project",
             "list_threads",
