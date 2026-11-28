@@ -115,9 +115,19 @@ pub fn capture(
     root: &Path,
     paths: &[PathBuf],
 ) -> Result<String, String> {
-    use std::os::unix::ffi::OsStrExt;
     checked_dir(guard, root)?;
     let git = PrivateGit::open(guard, data, true)?;
+    capture_in(&git, guard, root, paths)
+}
+
+#[cfg(unix)]
+fn capture_in(
+    git: &PrivateGit,
+    guard: &FsGuard,
+    root: &Path,
+    paths: &[PathBuf],
+) -> Result<String, String> {
+    use std::os::unix::ffi::OsStrExt;
     let mut entries = Vec::new();
     for path in paths {
         let entry = guard
@@ -325,16 +335,21 @@ pub fn files(
 
 fn files_in(git: &PrivateGit, before: &str, after: &str) -> Result<Vec<DiffFile>, String> {
     Ok(raw_files(git, before, after)?
-        .into_iter()
-        .map(|file| DiffFile {
-            id: path_id(&file.path),
-            path: String::from_utf8_lossy(&file.path).into_owned(),
-            old_path: file
-                .old_path
-                .map(|path| String::from_utf8_lossy(&path).into_owned()),
-            status: file.status,
-        })
+        .iter()
+        .map(display_file)
         .collect())
+}
+
+fn display_file(file: &RawDiffFile) -> DiffFile {
+    DiffFile {
+        id: path_id(&file.path),
+        path: String::from_utf8_lossy(&file.path).into_owned(),
+        old_path: file
+            .old_path
+            .as_ref()
+            .map(|path| String::from_utf8_lossy(path).into_owned()),
+        status: file.status.clone(),
+    }
 }
 
 #[cfg(unix)]
@@ -444,8 +459,7 @@ pub fn recover_live_reviews(guard: &FsGuard, parent: &Path) -> Result<(), String
 #[cfg(unix)]
 pub struct LiveReview {
     git: PrivateGit,
-    before: String,
-    after: String,
+    files: Vec<RawDiffFile>,
     _directory: ReviewDirectory,
 }
 
@@ -471,10 +485,11 @@ impl LiveReview {
         };
         write_review_marker(&directory._lease)?;
         let data = directory.temp.path();
-        let paths = select(guard, data, root, gitdir, common)?;
-        let after = capture(guard, data, root, &paths)?;
+        let mut git = PrivateGit::open(guard, data, true)?;
+        let paths = select_in(&git, guard, root, gitdir, common)?;
+        git.index = git._temp.path().join("capture-index");
+        let after = capture_in(&git, guard, root, &paths)?;
         valid_trees(base, &after)?;
-        let mut git = PrivateGit::open(guard, data, false)?;
         let alternate = git._temp.path().join("source-objects");
         // Git parses this environment variable as a path list.
         let path = alternate
@@ -486,33 +501,25 @@ impl LiveReview {
         std::fs::create_dir(&alternate).map_err(|e| e.to_string())?;
         guard.copy_git_objects(&common.join("objects"), &alternate)?;
         git.alternate = Some(alternate);
-        let tree = git.git(
-            &[
-                "rev-parse".into(),
-                "--verify".into(),
-                format!("{base}^{{tree}}").into(),
-            ],
-            &mut &[][..],
-        )?;
-        let before = String::from_utf8(tree)
-            .map_err(|e| e.to_string())?
-            .trim()
-            .to_owned();
-        valid_trees(&before, &after)?;
+        let files = raw_files(&git, base, &after)?;
         Ok(Self {
             git,
-            before,
-            after,
+            files,
             _directory: directory,
         })
     }
 
     pub fn files(&self) -> Result<Vec<DiffFile>, String> {
-        files_in(&self.git, &self.before, &self.after)
+        Ok(self.files.iter().map(display_file).collect())
     }
 
     pub fn file_diff(&self, id: &str) -> Result<FileDiff, String> {
-        file_diff_in(&self.git, &self.before, &self.after, id)
+        let file = self
+            .files
+            .iter()
+            .find(|file| path_id(&file.path) == id)
+            .ok_or("unknown diff file")?;
+        diff_raw_file(&self.git, file)
     }
 }
 
@@ -535,31 +542,54 @@ fn file_diff_in(git: &PrivateGit, before: &str, after: &str, id: &str) -> Result
         .into_iter()
         .find(|file| path_id(&file.path) == id)
         .ok_or("unknown diff file")?;
-    let blob = |id: &str| -> Result<Vec<u8>, String> {
-        if id.bytes().all(|byte| byte == b'0') {
-            Ok(Vec::new())
-        } else {
-            git.git(&["cat-file".into(), "blob".into(), id.into()], &mut &[][..])
-        }
+    diff_raw_file(git, &file)
+}
+
+#[cfg(unix)]
+fn diff_raw_file(git: &PrivateGit, file: &RawDiffFile) -> Result<FileDiff, String> {
+    let patch = if [&file.old_blob, &file.new_blob]
+        .iter()
+        .all(|id| !id.bytes().all(|byte| byte == b'0'))
+    {
+        git.git(
+            &[
+                "diff".into(),
+                "--no-ext-diff".into(),
+                "--no-textconv".into(),
+                "--no-color".into(),
+                file.old_blob.clone().into(),
+                file.new_blob.clone().into(),
+                "--".into(),
+            ],
+            &mut &[][..],
+        )?
+    } else {
+        let blob = |id: &str| -> Result<Vec<u8>, String> {
+            if id.bytes().all(|byte| byte == b'0') {
+                Ok(Vec::new())
+            } else {
+                git.git(&["cat-file".into(), "blob".into(), id.into()], &mut &[][..])
+            }
+        };
+        let temporary = tempfile::tempdir_in(git._temp.path()).map_err(|e| e.to_string())?;
+        let old_path = temporary.path().join("old");
+        let new_path = temporary.path().join("new");
+        std::fs::write(&old_path, blob(&file.old_blob)?).map_err(|e| e.to_string())?;
+        std::fs::write(&new_path, blob(&file.new_blob)?).map_err(|e| e.to_string())?;
+        git.git(
+            &[
+                "diff".into(),
+                "--no-index".into(),
+                "--no-ext-diff".into(),
+                "--no-textconv".into(),
+                "--no-color".into(),
+                "--".into(),
+                old_path.into_os_string(),
+                new_path.into_os_string(),
+            ],
+            &mut &[][..],
+        )?
     };
-    let temporary = tempfile::tempdir_in(git._temp.path()).map_err(|e| e.to_string())?;
-    let old_path = temporary.path().join("old");
-    let new_path = temporary.path().join("new");
-    std::fs::write(&old_path, blob(&file.old_blob)?).map_err(|e| e.to_string())?;
-    std::fs::write(&new_path, blob(&file.new_blob)?).map_err(|e| e.to_string())?;
-    let patch = git.git(
-        &[
-            "diff".into(),
-            "--no-index".into(),
-            "--no-ext-diff".into(),
-            "--no-textconv".into(),
-            "--no-color".into(),
-            "--".into(),
-            old_path.into_os_string(),
-            new_path.into_os_string(),
-        ],
-        &mut &[][..],
-    )?;
     let mut result = FileDiff {
         binary: false,
         hunks: Vec::new(),
@@ -677,6 +707,18 @@ pub fn select(
     gitdir: &Path,
     common: &Path,
 ) -> Result<Vec<PathBuf>, String> {
+    let git = PrivateGit::open(guard, data, true)?;
+    select_in(&git, guard, root, gitdir, common)
+}
+
+#[cfg(unix)]
+fn select_in(
+    git: &PrivateGit,
+    guard: &FsGuard,
+    root: &Path,
+    gitdir: &Path,
+    common: &Path,
+) -> Result<Vec<PathBuf>, String> {
     use std::collections::BTreeSet;
     use std::os::unix::ffi::OsStringExt;
 
@@ -685,7 +727,6 @@ pub fn select(
         return Err("snapshot checkout contains protected paths".into());
     }
     checked_dir(guard, gitdir)?;
-    let git = PrivateGit::open(guard, data, true)?;
     match guard.read_snapshot_entry(gitdir, Path::new("index")) {
         Ok(SnapshotEntry::File(mut source, _)) => {
             let mut target = std::fs::File::create(&git.index).map_err(|e| e.to_string())?;
@@ -704,33 +745,40 @@ pub fn select(
         Err(crate::fsguard::FsError::Io(e)) if e.kind() == io::ErrorKind::NotFound => false,
         _ => return Err("invalid Git exclude file".into()),
     };
-    let list = |options: &[&str], include_exclude: bool| -> Result<BTreeSet<Vec<u8>>, String> {
-        let mut args = vec![
-            "-C".into(),
-            root.as_os_str().to_owned(),
-            "--work-tree".into(),
-            root.as_os_str().to_owned(),
-            "ls-files".into(),
-            "-z".into(),
-        ];
-        args.extend(options.iter().map(OsString::from));
-        if include_exclude && has_exclude {
-            args.push("--exclude-from".into());
-            args.push(exclude.as_os_str().to_owned());
+    let mut args = vec![
+        "-C".into(),
+        root.as_os_str().to_owned(),
+        "--work-tree".into(),
+        root.as_os_str().to_owned(),
+        "ls-files".into(),
+        "-z".into(),
+        "-t".into(),
+        "--cached".into(),
+        "--others".into(),
+        "--deleted".into(),
+        "--exclude-per-directory=.gitignore".into(),
+    ];
+    if has_exclude {
+        args.push("--exclude-from".into());
+        args.push(exclude.as_os_str().to_owned());
+    }
+    let output = git.git(&args, &mut &[][..])?;
+    let mut paths = BTreeSet::new();
+    let mut deleted = BTreeSet::new();
+    for entry in output.split(|b| *b == 0).filter(|p| !p.is_empty()) {
+        let path = entry.get(2..).ok_or("invalid Git file listing")?;
+        match entry.first() {
+            Some(b'R') => {
+                deleted.insert(path.to_vec());
+            }
+            Some(b'H' | b'?' | b'S' | b'M') => {
+                paths.insert(path.to_vec());
+            }
+            _ => return Err("unsupported Git index entry".into()),
         }
-        Ok(git
-            .git(&args, &mut &[][..])?
-            .split(|b| *b == 0)
-            .filter(|p| !p.is_empty())
-            .map(<[u8]>::to_vec)
-            .collect())
-    };
-    let mut paths = list(
-        &["--cached", "--others", "--exclude-per-directory=.gitignore"],
-        true,
-    )?;
-    for deleted in list(&["--deleted"], false)? {
-        paths.remove(&deleted);
+    }
+    for path in deleted {
+        paths.remove(&path);
     }
     Ok(paths
         .into_iter()
