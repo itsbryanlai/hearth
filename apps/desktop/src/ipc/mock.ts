@@ -163,6 +163,10 @@ export function createMockIpc(options: Options = {}): Ipc {
       };
     },
     reviewTurns: async (threadId) => (turns.get(threadId) ?? []).map((t) => ({ turnId: t.turnId, label: t.input.kind === "text" ? t.input.text : "Turn", available: false })),
+    startWorktreeReview: async () => "mock-review",
+    worktreeDiffFiles: async () => null,
+    worktreeDiffFile: async () => null,
+    releaseWorktreeReview: async () => {},
     turnDiffFiles: async () => null,
     turnDiffFile: async () => null,
     async listThreadModels(threadId) {

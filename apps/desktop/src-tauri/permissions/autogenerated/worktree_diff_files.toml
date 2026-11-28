@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-worktree-diff-files"
+description = "Enables the worktree_diff_files command without any pre-configured scope."
+commands.allow = ["worktree_diff_files"]
+
+[[permission]]
+identifier = "deny-worktree-diff-files"
+description = "Denies the worktree_diff_files command without any pre-configured scope."
+commands.deny = ["worktree_diff_files"]

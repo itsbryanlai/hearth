@@ -55,11 +55,15 @@ function fakeIpc(snapshot: ThreadSnapshot = { thread: THREAD, turns: [], lastSeq
     listAgents: vi.fn(async (): Promise<InstalledAgent[]> => [{ ...CLAUDE, remembersApprovals: true }]),
     listProjects: vi.fn(async () => [{ id: "p", name: "proj", path: "/work/proj" }]),
     addProject: vi.fn(),
-    listThreads: vi.fn(async () => [THREAD]),
+    listThreads: vi.fn<Ipc["listThreads"]>(async () => [THREAD]),
     worktreeInfo: vi.fn<Ipc["worktreeInfo"]>(async () => ({ isGit: false, base: null, reason: null })),
     createThread: vi.fn(),
     loadThread: vi.fn(async () => snapshot),
     reviewTurns: vi.fn<Ipc["reviewTurns"]>(async () => []),
+    startWorktreeReview: vi.fn<Ipc["startWorktreeReview"]>(async () => "review"),
+    worktreeDiffFiles: vi.fn<Ipc["worktreeDiffFiles"]>(async () => null),
+    worktreeDiffFile: vi.fn<Ipc["worktreeDiffFile"]>(async () => null),
+    releaseWorktreeReview: vi.fn<Ipc["releaseWorktreeReview"]>(async () => {}),
     turnDiffFiles: vi.fn<Ipc["turnDiffFiles"]>(async () => null),
     turnDiffFile: vi.fn<Ipc["turnDiffFile"]>(async () => null),
     listThreadModels: vi.fn(async (): Promise<ThreadModels> => ({ choices: [], selected: null, current: null })),
@@ -80,7 +84,7 @@ function fakeIpc(snapshot: ThreadSnapshot = { thread: THREAD, turns: [], lastSeq
 async function openThread(ipc: Ipc, f = frames()) {
   const store = createAppStore(ipc, { raf: f.raf });
   render(<App store={store} />);
-  fireEvent.click(await screen.findByRole("button", { name: "Thread one" }));
+  fireEvent.click(await screen.findByRole("button", { name: /^Thread one/ }));
   await screen.findByLabelText("Message");
   await vi.waitFor(() => expect((screen.getByLabelText("Message") as HTMLTextAreaElement).disabled).toBe(false));
   return { store, f };
@@ -445,4 +449,52 @@ test("keeps unavailable and empty turn results scoped to the selection", async (
   fireEvent.change(screen.getByLabelText("Turn"), { target: { value: "old" } });
   await act(async () => resolveOld(null));
   expect(await screen.findByText("Snapshot unavailable for this turn.")).toBeTruthy();
+});
+
+// Fails if refresh or switching scope leaves a review allocated or loses the historical diff.
+test("refreshes and releases worktree reviews while preserving turn changes", async () => {
+  const thread = { ...THREAD, branch: "feature" };
+  const { ipc } = fakeIpc({ thread, lastSeq: 0, turns: [] });
+  ipc.listThreads.mockResolvedValue([thread]);
+  ipc.reviewTurns.mockResolvedValue([{ turnId: "t", label: "Turn", available: true }]);
+  ipc.turnDiffFiles.mockResolvedValue([{ id: "f", path: "turn.txt", oldPath: null, status: "modified" }]);
+  ipc.turnDiffFile.mockResolvedValue({ binary: false, hunks: [{ header: "@@", rows: [{ kind: "add", text: "historical", oldLine: null, newLine: 1 }], splitRows: [] }] });
+  ipc.startWorktreeReview.mockResolvedValueOnce("one").mockResolvedValueOnce("two");
+  ipc.worktreeDiffFiles.mockImplementation(async (_thread, id) => ({ id, files: [{ id: "wf", path: "worktree.txt", oldPath: null, status: "modified" }] }));
+  ipc.worktreeDiffFile.mockImplementation(async (_thread, id) => ({ binary: false, hunks: [{ header: "@@", rows: [{ kind: "add", text: `worktree ${id}`, oldLine: null, newLine: 1 }], splitRows: [] }] }));
+  await openThread(ipc);
+  fireEvent.click(screen.getByRole("button", { name: "Changes" }));
+  expect(await screen.findByText(/historical/)).toBeTruthy();
+  fireEvent.change(screen.getByLabelText("Scope"), { target: { value: "worktree" } });
+  expect(await screen.findByText(/worktree one/)).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+  await vi.waitFor(() => expect(ipc.releaseWorktreeReview).toHaveBeenCalledWith("th", "one"));
+  expect(await screen.findByText(/worktree two/)).toBeTruthy();
+  fireEvent.change(screen.getByLabelText("Scope"), { target: { value: "turn" } });
+  await vi.waitFor(() => expect(ipc.releaseWorktreeReview).toHaveBeenCalledWith("th", "two"));
+  expect(await screen.findByText(/historical/)).toBeTruthy();
+});
+
+// Fails if a reservation arriving after close is captured or left allocated.
+test("releases a late worktree reservation after closing changes", async () => {
+  const thread = { ...THREAD, branch: "feature" };
+  const { ipc } = fakeIpc({ thread, lastSeq: 0, turns: [] });
+  ipc.listThreads.mockResolvedValue([thread]);
+  let resolveStart: (id: string) => void = () => {};
+  ipc.startWorktreeReview.mockImplementationOnce(() => new Promise((resolve) => { resolveStart = resolve; }));
+  ipc.worktreeDiffFiles.mockResolvedValue({ id: "review", files: [] });
+  await openThread(ipc);
+  fireEvent.click(screen.getByRole("button", { name: "Changes" }));
+  fireEvent.change(screen.getByLabelText("Scope"), { target: { value: "worktree" } });
+  await vi.waitFor(() => expect(ipc.startWorktreeReview).toHaveBeenCalledTimes(1));
+  fireEvent.click(screen.getByRole("button", { name: "Close changes" }));
+  fireEvent.click(screen.getByRole("button", { name: "Changes" }));
+  fireEvent.change(screen.getByLabelText("Scope"), { target: { value: "worktree" } });
+  expect(ipc.startWorktreeReview).toHaveBeenCalledTimes(1);
+  await act(async () => resolveStart("late"));
+  expect(ipc.releaseWorktreeReview).toHaveBeenCalledWith("th", "late");
+  expect(await screen.findByText("No files changed in this worktree.")).toBeTruthy();
+  expect(ipc.startWorktreeReview).toHaveBeenCalledTimes(2);
+  expect(ipc.worktreeDiffFiles).toHaveBeenCalledOnce();
+  expect(ipc.worktreeDiffFiles).toHaveBeenCalledWith("th", "review");
 });

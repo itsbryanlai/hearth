@@ -9,7 +9,7 @@ mod engine;
 
 pub use api::{
     AgentStatus, EngineError, EventSink, InstalledAgent, Project, ReviewTurn, ThreadEventPayload,
-    ThreadModels, ThreadSnapshot, ThreadSummary, TurnSnapshot, WorktreeInfo,
+    ThreadModels, ThreadSnapshot, ThreadSummary, TurnSnapshot, WorktreeInfo, WorktreeReview,
 };
 pub use engine::{Engine, EngineConfig};
 

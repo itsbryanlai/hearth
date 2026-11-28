@@ -36,6 +36,10 @@ export type AppState = {
   activeThreadId: string | null;
   error: string | null;
   reviewTurns: Ipc["reviewTurns"];
+  startWorktreeReview: Ipc["startWorktreeReview"];
+  worktreeDiffFiles: Ipc["worktreeDiffFiles"];
+  worktreeDiffFile: Ipc["worktreeDiffFile"];
+  releaseWorktreeReview: Ipc["releaseWorktreeReview"];
   turnDiffFiles: Ipc["turnDiffFiles"];
   turnDiffFile: Ipc["turnDiffFile"];
   init(): Promise<void>;
@@ -83,6 +87,7 @@ export function createAppStore(ipc: Ipc, options: Options = {}): AppStore {
   let buffer: ThreadEventPayload[] = [];
   let frameScheduled = false;
   const loading = new Set<string>();
+  const reviewStarts = new Map<string, Promise<void>>();
   const pendingAnswers = new Set<string>();
   const pendingSends = new Map<string, { modelUpdated: boolean }>();
   let unsubscribe: (() => void) | undefined;
@@ -189,6 +194,19 @@ export function createAppStore(ipc: Ipc, options: Options = {}): AppStore {
         }
       },
       reviewTurns: (threadId) => ipc.reviewTurns(threadId),
+      startWorktreeReview: (threadId) => {
+        const previous = reviewStarts.get(threadId) ?? Promise.resolve();
+        const result = previous.then(() => ipc.startWorktreeReview(threadId));
+        const tail = result.then(() => {}, () => {});
+        reviewStarts.set(threadId, tail);
+        void tail.then(() => {
+          if (reviewStarts.get(threadId) === tail) reviewStarts.delete(threadId);
+        });
+        return result;
+      },
+      worktreeDiffFiles: (threadId, reviewId) => ipc.worktreeDiffFiles(threadId, reviewId),
+      worktreeDiffFile: (threadId, reviewId, fileId) => ipc.worktreeDiffFile(threadId, reviewId, fileId),
+      releaseWorktreeReview: (threadId, reviewId) => ipc.releaseWorktreeReview(threadId, reviewId),
       turnDiffFiles: (threadId, turnId) => ipc.turnDiffFiles(threadId, turnId),
       turnDiffFile: (threadId, turnId, fileId) => ipc.turnDiffFile(threadId, turnId, fileId),
       worktreeInfo: (projectId) => ipc.worktreeInfo(projectId),

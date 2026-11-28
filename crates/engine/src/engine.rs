@@ -5,7 +5,7 @@ use crate::agents::{
 };
 use crate::api::{
     AgentStatus, EngineError, EventSink, InstalledAgent, Project, ReviewTurn, ThreadEventPayload,
-    ThreadModels, ThreadSnapshot, ThreadSummary, TurnSnapshot, WorktreeInfo,
+    ThreadModels, ThreadSnapshot, ThreadSummary, TurnSnapshot, WorktreeInfo, WorktreeReview,
 };
 use crate::coalesce::coalesce;
 use hearth_core::fsguard::FsGuard;
@@ -46,6 +46,8 @@ struct Inner {
     guard: Mutex<FsGuard>,
     home: PathBuf,
     snapshot_parent: Option<PathBuf>,
+    #[cfg(unix)]
+    reviews: Mutex<HashMap<ThreadId, LiveReviewState>>,
     sink: Arc<dyn EventSink>,
     agents: Vec<Registration>,
     sessions: tokio::sync::Mutex<HashMap<ThreadId, Arc<Live>>>,
@@ -53,6 +55,61 @@ struct Inner {
     /// Next `seq` to hand out, per thread.
     seqs: Mutex<HashMap<ThreadId, u64>>,
     cancel_grace_ms: AtomicU64,
+}
+
+#[cfg(unix)]
+struct LiveReviewEntry {
+    id: String,
+    root: PathBuf,
+    gitdir: PathBuf,
+    common: PathBuf,
+    review: Arc<hearth_core::snapshot::LiveReview>,
+}
+
+#[cfg(unix)]
+enum LiveReviewState {
+    Pending(String),
+    Capturing(String),
+    Ready(LiveReviewEntry),
+}
+
+#[cfg(unix)]
+impl LiveReviewState {
+    fn id(&self) -> &str {
+        match self {
+            Self::Pending(id) | Self::Capturing(id) => id,
+            Self::Ready(entry) => &entry.id,
+        }
+    }
+}
+
+#[cfg(unix)]
+fn retire_review(review: Option<LiveReviewState>) {
+    if let Some(LiveReviewState::Ready(entry)) = review {
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn_blocking(move || drop(entry));
+        } else {
+            std::thread::spawn(move || drop(entry));
+        }
+    }
+}
+
+#[cfg(unix)]
+struct ReviewReservation<'a> {
+    inner: &'a Inner,
+    thread: &'a ThreadId,
+    id: String,
+}
+
+#[cfg(unix)]
+impl Drop for ReviewReservation<'_> {
+    fn drop(&mut self) {
+        let mut reviews = lock(&self.inner.reviews);
+        if matches!(reviews.get(self.thread), Some(LiveReviewState::Capturing(id)) if id == &self.id)
+        {
+            reviews.remove(self.thread);
+        }
+    }
 }
 
 /// One live agent process and the approvals it is waiting on.
@@ -151,6 +208,14 @@ impl Engine {
             .as_ref()
             .and_then(|p| p.parent())
             .map(Path::to_path_buf);
+        #[cfg(unix)]
+        if let Some(parent) = snapshot_parent.clone() {
+            let home = config.home.clone();
+            std::thread::spawn(move || {
+                let guard = FsGuard::new([parent.clone()], home);
+                let _ = hearth_core::snapshot::recover_live_reviews(&guard, &parent);
+            });
+        }
         let mut roots = config.roots;
         for project in store.list_projects()? {
             let project_path = PathBuf::from(&project.path);
@@ -175,6 +240,8 @@ impl Engine {
                 guard: Mutex::new(FsGuard::new(roots, config.home.clone())),
                 home: config.home,
                 snapshot_parent,
+                #[cfg(unix)]
+                reviews: Default::default(),
                 sink,
                 agents: config.agents,
                 sessions: Default::default(),
@@ -444,6 +511,211 @@ impl Engine {
                 }
             })
             .collect())
+    }
+
+    /// Reserves an identity before capture so a closing panel can cancel it.
+    #[cfg(unix)]
+    pub fn start_worktree_review(&self, thread: &ThreadId) -> String {
+        let id = ThreadId::new().0;
+        let retired =
+            lock(&self.inner.reviews).insert(thread.clone(), LiveReviewState::Pending(id.clone()));
+        retire_review(retired);
+        id
+    }
+
+    /// Captures a worktree against the immutable base saved with the thread.
+    #[cfg(unix)]
+    pub async fn worktree_diff_files(
+        &self,
+        thread: &ThreadId,
+        id: &str,
+    ) -> Result<Option<WorktreeReview>, EngineError> {
+        {
+            let mut reviews = lock(&self.inner.reviews);
+            if !matches!(reviews.get(thread), Some(LiveReviewState::Pending(pending)) if pending == id)
+            {
+                return Ok(None);
+            }
+            reviews.insert(thread.clone(), LiveReviewState::Capturing(id.to_owned()));
+        }
+        let id = id.to_owned();
+        let _reservation = ReviewReservation {
+            inner: &self.inner,
+            thread,
+            id: id.clone(),
+        };
+        let (saved, project) = {
+            let store = lock(&self.inner.store);
+            let saved = store.get_thread(thread)?;
+            let project = store
+                .list_projects()?
+                .into_iter()
+                .find(|p| p.id == saved.project_id)
+                .ok_or("unknown project")?;
+            (saved, project)
+        };
+        let Some(base) = saved.base_ref.clone() else {
+            return Ok(None);
+        };
+        let Some(parent) = self.inner.snapshot_parent.clone() else {
+            return Ok(None);
+        };
+        if saved.worktree_path.as_deref() != Some(saved.cwd.as_str()) {
+            return Ok(None);
+        }
+        let root = PathBuf::from(&saved.cwd);
+        if lock(&self.inner.guard)
+            .try_check(&root)
+            .ok()
+            .map(|p| p.as_path().to_path_buf())
+            .as_deref()
+            != Some(root.as_path())
+        {
+            return Ok(None);
+        }
+        let home = self.inner.home.clone();
+        let project = PathBuf::from(project.path);
+        let captured = tokio::task::spawn_blocking(move || -> Option<_> {
+            let owner = FsGuard::new([project.clone()], home.clone());
+            let guard = FsGuard::new([project.clone(), root.clone(), parent.clone()], home);
+            let (_, common) = owner.git_metadata_dirs(&project, &owner).ok()??;
+            let (gitdir, checkout_common) = guard.git_metadata_dirs(&root, &owner).ok()??;
+            if common != checkout_common {
+                return None;
+            }
+            let parent = guard.try_check(&parent).ok()?;
+            let review = hearth_core::snapshot::LiveReview::open(
+                &guard,
+                parent.as_path(),
+                &root,
+                &gitdir,
+                &common,
+                &base,
+            )
+            .ok()?;
+            let files = review.files().ok()?;
+            Some((root, gitdir, common, review, files))
+        })
+        .await;
+        let mut reviews = lock(&self.inner.reviews);
+        if !matches!(reviews.get(thread), Some(LiveReviewState::Capturing(pending)) if pending == &id)
+        {
+            drop(reviews);
+            if let Ok(Some((_, _, _, review, _))) = captured {
+                tokio::task::spawn_blocking(move || drop(review));
+            }
+            return Ok(None);
+        }
+        let Some((root, gitdir, common, review, files)) =
+            captured.map_err(|e| EngineError(e.to_string()))?
+        else {
+            reviews.remove(thread);
+            return Ok(None);
+        };
+        reviews.insert(
+            thread.clone(),
+            LiveReviewState::Ready(LiveReviewEntry {
+                id: id.clone(),
+                root,
+                gitdir,
+                common,
+                review: Arc::new(review),
+            }),
+        );
+        Ok(Some(WorktreeReview { id, files }))
+    }
+
+    /// Reads a file from the exact captured review; a refresh invalidates its ID.
+    #[cfg(unix)]
+    pub async fn worktree_diff_file(
+        &self,
+        thread: &ThreadId,
+        review_id: &str,
+        file_id: &str,
+    ) -> Result<Option<hearth_core::snapshot::FileDiff>, EngineError> {
+        let (root, gitdir, common, review) = {
+            let reviews = lock(&self.inner.reviews);
+            let Some(LiveReviewState::Ready(entry)) =
+                reviews.get(thread).filter(|entry| entry.id() == review_id)
+            else {
+                return Ok(None);
+            };
+            (
+                entry.root.clone(),
+                entry.gitdir.clone(),
+                entry.common.clone(),
+                entry.review.clone(),
+            )
+        };
+        let (saved, project) = {
+            let store = lock(&self.inner.store);
+            let saved = store.get_thread(thread)?;
+            let project = store
+                .list_projects()?
+                .into_iter()
+                .find(|p| p.id == saved.project_id)
+                .ok_or("unknown project")?;
+            (saved, project)
+        };
+        if saved.worktree_path.as_deref() != Some(saved.cwd.as_str())
+            || Path::new(&saved.cwd) != root
+            || lock(&self.inner.guard)
+                .try_check(&root)
+                .ok()
+                .map(|p| p.as_path().to_path_buf())
+                .as_deref()
+                != Some(root.as_path())
+        {
+            tokio::task::spawn_blocking(move || drop(review));
+            return Ok(None);
+        }
+        let home = self.inner.home.clone();
+        let file_id = file_id.to_owned();
+        let result = tokio::task::spawn_blocking(move || {
+            let project = PathBuf::from(project.path);
+            let owner = FsGuard::new([project.clone()], home.clone());
+            let guard = FsGuard::new([root.clone()], home);
+            let owner_common = owner
+                .git_metadata_dirs(&project, &owner)
+                .ok()
+                .flatten()
+                .map(|(_, common)| common);
+            let checkout_metadata = guard.git_metadata_dirs(&root, &owner).ok().flatten();
+            if owner_common.as_ref() != Some(&common)
+                || checkout_metadata.as_ref() != Some(&(gitdir, common))
+            {
+                return Ok(None);
+            }
+            review.file_diff(&file_id).map(Some).map_err(EngineError)
+        })
+        .await
+        .map_err(|e| EngineError(e.to_string()))?;
+        if !lock(&self.inner.reviews)
+            .get(thread)
+            .is_some_and(|entry| entry.id() == review_id)
+        {
+            return Ok(None);
+        }
+        result
+    }
+
+    /// Drops a captured review when its panel closes or switches scope.
+    #[cfg(unix)]
+    pub async fn release_worktree_review(&self, thread: &ThreadId, review_id: &str) {
+        let retired = {
+            let mut reviews = lock(&self.inner.reviews);
+            if reviews
+                .get(thread)
+                .is_some_and(|entry| entry.id() == review_id)
+            {
+                reviews.remove(thread)
+            } else {
+                None
+            }
+        };
+        if let Some(LiveReviewState::Ready(entry)) = retired {
+            let _ = tokio::task::spawn_blocking(move || drop(entry)).await;
+        }
     }
 
     /// Lists files from retained trees; None means the snapshots are unavailable.
