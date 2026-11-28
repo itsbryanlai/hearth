@@ -388,6 +388,35 @@ impl Store {
         Ok(turn)
     }
 
+    /// Lists assistant turns and their preceding user input without loading events.
+    pub fn review_turns(
+        &self,
+        thread: &ThreadId,
+    ) -> Result<Vec<(TurnId, Option<UserInput>, bool)>> {
+        let mut statement = self.conn.prepare(
+            "SELECT current.id, previous.input_json, (previous.tree_snapshot IS NOT NULL AND current.tree_snapshot IS NOT NULL) FROM turns current LEFT JOIN turns previous ON previous.thread_id = current.thread_id AND previous.seq = current.seq - 1 AND previous.role = 'user' WHERE current.thread_id = ?1 AND current.role = 'assistant' ORDER BY current.seq"
+        )?;
+        let rows = statement.query_map([&thread.0], |row| {
+            Ok((
+                TurnId(row.get(0)?),
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, bool>(2)?,
+            ))
+        })?;
+        let mut turns = Vec::new();
+        for row in rows {
+            let (id, input, available) = row?;
+            turns.push((
+                id,
+                input
+                    .map(|value| serde_json::from_str(&value))
+                    .transpose()?,
+                available,
+            ));
+        }
+        Ok(turns)
+    }
+
     pub fn turn_tree_pair(
         &self,
         thread: &ThreadId,

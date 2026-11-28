@@ -4,8 +4,8 @@ use crate::agents::{
     AgentItem, AgentSession, AgentStream, EnvPassthrough, Registration, StreamItem,
 };
 use crate::api::{
-    AgentStatus, EngineError, EventSink, InstalledAgent, Project, ThreadEventPayload, ThreadModels,
-    ThreadSnapshot, ThreadSummary, TurnSnapshot, WorktreeInfo,
+    AgentStatus, EngineError, EventSink, InstalledAgent, Project, ReviewTurn, ThreadEventPayload,
+    ThreadModels, ThreadSnapshot, ThreadSummary, TurnSnapshot, WorktreeInfo,
 };
 use crate::coalesce::coalesce;
 use hearth_core::fsguard::FsGuard;
@@ -418,6 +418,90 @@ impl Engine {
                 Err(EngineError(error.to_string()))
             }
         }
+    }
+
+    /// Lists reviewable assistant turns without loading their events.
+    pub fn review_turns(&self, thread: &ThreadId) -> Result<Vec<ReviewTurn>, EngineError> {
+        let turns = lock(&self.inner.store).review_turns(thread)?;
+        Ok(turns
+            .into_iter()
+            .enumerate()
+            .map(|(index, (turn_id, input, available))| {
+                let label = match input {
+                    Some(UserInput::Text { text }) if !text.trim().is_empty() => text
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        .chars()
+                        .take(80)
+                        .collect(),
+                    _ => format!("Turn {}", index + 1),
+                };
+                ReviewTurn {
+                    turn_id,
+                    label,
+                    available: available && self.inner.snapshot_parent.is_some(),
+                }
+            })
+            .collect())
+    }
+
+    /// Lists files from retained trees; None means the snapshots are unavailable.
+    pub async fn turn_diff_files(
+        &self,
+        thread: &ThreadId,
+        turn: &TurnId,
+    ) -> Result<Option<Vec<hearth_core::snapshot::DiffFile>>, EngineError> {
+        let (before, after) = lock(&self.inner.store)
+            .turn_tree_pair(thread, turn)?
+            .ok_or("unknown assistant turn")?;
+        let (Some(before), Some(after), Some(parent)) =
+            (before, after, self.inner.snapshot_parent.clone())
+        else {
+            return Ok(None);
+        };
+        let home = self.inner.home.clone();
+        Ok(tokio::task::spawn_blocking(move || {
+            let guard = FsGuard::new([parent.clone()], home);
+            let data = guard.try_check(&parent).ok()?.as_path().join("snapshots");
+            hearth_core::snapshot::files(&guard, &data, &before, &after).ok()
+        })
+        .await
+        .ok()
+        .flatten())
+    }
+
+    /// Reads a previously listed file from retained trees on a blocking task.
+    #[cfg(unix)]
+    pub async fn turn_diff_file(
+        &self,
+        thread: &ThreadId,
+        turn: &TurnId,
+        id: &str,
+    ) -> Result<Option<hearth_core::snapshot::FileDiff>, EngineError> {
+        let (before, after) = lock(&self.inner.store)
+            .turn_tree_pair(thread, turn)?
+            .ok_or("unknown assistant turn")?;
+        let (Some(before), Some(after), Some(parent)) =
+            (before, after, self.inner.snapshot_parent.clone())
+        else {
+            return Ok(None);
+        };
+        let home = self.inner.home.clone();
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let guard = FsGuard::new([parent.clone()], home);
+            let data = guard
+                .try_check(&parent)
+                .map_err(|e| EngineError(e.to_string()))?
+                .as_path()
+                .join("snapshots");
+            hearth_core::snapshot::file_diff(&guard, &data, &before, &after, &id)
+                .map(Some)
+                .map_err(EngineError)
+        })
+        .await
+        .map_err(|e| EngineError(e.to_string()))?
     }
 
     /// Returns the retained diff for an assistant turn, or None if unavailable.

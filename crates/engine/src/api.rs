@@ -64,6 +64,15 @@ pub struct ThreadModels {
     pub current: Option<String>,
 }
 
+/// An assistant turn available for review, including turns without retained snapshots.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewTurn {
+    pub turn_id: TurnId,
+    pub label: String,
+    pub available: bool,
+}
+
 /// One user message and the agent events it produced, in order.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]

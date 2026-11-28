@@ -1206,6 +1206,50 @@ async fn snapshots_changed_checkout_and_reopens_the_diff() {
         .unwrap();
     let events = until(&mut rx, is_end).await;
     let turn = events.last().unwrap().turn_id.clone();
+    let reviews = app.review_turns(&thread).unwrap();
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews[0].turn_id, turn);
+    assert_eq!(reviews[0].label, "go");
+    assert!(reviews[0].available);
+    let files = app.turn_diff_files(&thread, &turn).await.unwrap().unwrap();
+    let file = files.iter().find(|file| file.path == "file").unwrap();
+    assert_eq!(file.id, "66696c65");
+    assert_eq!(file.status, "M");
+    let content = app
+        .turn_diff_file(&thread, &turn, &file.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!content.binary);
+    assert_eq!(content.hunks[0].split_rows.len(), 1);
+    assert_eq!(
+        (
+            content.hunks[0].split_rows[0].left,
+            content.hunks[0].split_rows[0].right
+        ),
+        (Some(0), Some(1))
+    );
+    assert!(
+        content.hunks[0]
+            .rows
+            .iter()
+            .any(|row| row.kind == hearth_engine::DiffRowKind::Delete
+                && row.text == "before"
+                && row.old_line == Some(1))
+    );
+    assert!(
+        content.hunks[0]
+            .rows
+            .iter()
+            .any(|row| row.kind == hearth_engine::DiffRowKind::Add
+                && row.text == "after"
+                && row.new_line == Some(1))
+    );
+    assert!(
+        files
+            .iter()
+            .any(|file| file.path == "deleted" && file.status == "D")
+    );
     let diff = app.turn_diff(&thread, &turn).await.unwrap().unwrap();
     let text = String::from_utf8(diff.clone()).unwrap();
     assert!(
@@ -1260,6 +1304,16 @@ async fn snapshots_distinguish_empty_from_unavailable_without_losing_reply() {
         let events = until(&mut rx, is_end).await;
         let turn = &events.last().unwrap().turn_id;
         assert_eq!(
+            engine.review_turns(&thread).unwrap()[0].available,
+            scenario == "empty"
+        );
+        assert_eq!(
+            engine.turn_diff_files(&thread, turn).await.unwrap(),
+            (scenario == "empty").then(Vec::new)
+        );
+        let other = thread_of(&engine, &w).await;
+        assert!(engine.turn_diff_files(&other, turn).await.is_err());
+        assert_eq!(
             engine.turn_diff(&thread, turn).await.unwrap(),
             (scenario == "empty").then(Vec::new)
         );
@@ -1268,5 +1322,150 @@ async fn snapshots_distinguish_empty_from_unavailable_without_losing_reply() {
                 .events
                 .is_empty()
         );
+    }
+}
+
+// Fails if renamed raw paths, binary changes, or missing newlines are lost.
+#[tokio::test]
+async fn review_files_preserve_renames_raw_paths_and_binary_notices() {
+    use std::os::unix::ffi::OsStringExt;
+    let w = world();
+    let git = |args: &[&str]| {
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&w.project)
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        )
+    };
+    git(&["init", "-q"]);
+    let (old_bytes, new_bytes): (&[u8], &[u8]) = if cfg!(target_os = "macos") {
+        (b"old name", b"new name")
+    } else {
+        (b"old \xff", b"new \xfe")
+    };
+    let old = std::ffi::OsString::from_vec(old_bytes.to_vec());
+    let new = std::ffi::OsString::from_vec(new_bytes.to_vec());
+    std::fs::write(w.project.join(&old), "unchanged\n").unwrap();
+    std::fs::write(w.project.join("binary"), b"before\0x").unwrap();
+    std::fs::write(w.project.join("lines"), "old").unwrap();
+    git(&["add", "."]);
+    let (app, mut rx) = engine(&w, fixture("acp-approval-allowed.jsonl"));
+    let thread = thread_of(&app, &w).await;
+    app.send_message(&thread, say("go")).await.unwrap();
+    let approval = until(&mut rx, is_approval).await;
+    std::fs::rename(w.project.join(old), w.project.join(new)).unwrap();
+    std::fs::write(w.project.join("binary"), b"after\0x").unwrap();
+    std::fs::write(w.project.join("lines"), "new").unwrap();
+    let AgentEvent::ApprovalRequest { request } = &approval.last().unwrap().event else {
+        unreachable!()
+    };
+    app.answer_approval(&thread, &request.id, ApprovalDecision::AllowOnce)
+        .await
+        .unwrap();
+    let events = until(&mut rx, is_end).await;
+    let turn = &events.last().unwrap().turn_id;
+    let files = app.turn_diff_files(&thread, turn).await.unwrap().unwrap();
+    let renamed = files.iter().find(|f| f.status == "R").unwrap();
+    if cfg!(target_os = "macos") {
+        assert_eq!(renamed.id, "6e6577206e616d65");
+        assert_eq!(renamed.path, "new name");
+        assert_eq!(renamed.old_path.as_deref(), Some("old name"));
+    } else {
+        assert_eq!(renamed.id, "6e657720fe");
+        assert_eq!(renamed.path, "new �");
+        assert_eq!(renamed.old_path.as_deref(), Some("old �"));
+    }
+    assert!(
+        !app.turn_diff_file(&thread, turn, &renamed.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .binary
+    );
+    let binary = files.iter().find(|f| f.path == "binary").unwrap();
+    assert!(
+        app.turn_diff_file(&thread, turn, &binary.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .binary
+    );
+    let lines = files.iter().find(|f| f.path == "lines").unwrap();
+    let diff = app
+        .turn_diff_file(&thread, turn, &lines.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        diff.hunks[0]
+            .rows
+            .iter()
+            .filter(|r| r.kind == hearth_engine::DiffRowKind::Notice)
+            .count(),
+        2
+    );
+    assert_eq!(
+        diff.hunks[0]
+            .split_rows
+            .iter()
+            .filter(|row| row.notice.is_some())
+            .count(),
+        2
+    );
+}
+
+// Fails if a file replaced by a directory includes its descendant's patch.
+#[tokio::test]
+async fn review_file_replaced_by_directory_reads_each_file_separately() {
+    let w = world();
+    let git = |args: &[&str]| {
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&w.project)
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        )
+    };
+    git(&["init", "-q"]);
+    std::fs::write(w.project.join("foo"), "old file\n").unwrap();
+    git(&["add", "."]);
+    let (app, mut rx) = engine(&w, fixture("acp-approval-allowed.jsonl"));
+    let thread = thread_of(&app, &w).await;
+    app.send_message(&thread, say("go")).await.unwrap();
+    let approval = until(&mut rx, is_approval).await;
+    std::fs::remove_file(w.project.join("foo")).unwrap();
+    std::fs::create_dir(w.project.join("foo")).unwrap();
+    std::fs::write(w.project.join("foo/bar"), "new descendant\n").unwrap();
+    git(&["add", "-A"]);
+    let AgentEvent::ApprovalRequest { request } = &approval.last().unwrap().event else {
+        unreachable!()
+    };
+    app.answer_approval(&thread, &request.id, ApprovalDecision::AllowOnce)
+        .await
+        .unwrap();
+    let events = until(&mut rx, is_end).await;
+    let turn = &events.last().unwrap().turn_id;
+    let files = app.turn_diff_files(&thread, turn).await.unwrap().unwrap();
+    for (path, kind, text) in [
+        ("foo", hearth_engine::DiffRowKind::Delete, "old file"),
+        ("foo/bar", hearth_engine::DiffRowKind::Add, "new descendant"),
+    ] {
+        let file = files.iter().find(|file| file.path == path).unwrap();
+        let diff = app
+            .turn_diff_file(&thread, turn, &file.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let rows: Vec<_> = diff.hunks.iter().flat_map(|hunk| &hunk.rows).collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, kind);
+        assert_eq!(rows[0].text, text);
     }
 }

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-turn-diff-file"
+description = "Enables the turn_diff_file command without any pre-configured scope."
+commands.allow = ["turn_diff_file"]
+
+[[permission]]
+identifier = "deny-turn-diff-file"
+description = "Denies the turn_diff_file command without any pre-configured scope."
+commands.deny = ["turn_diff_file"]

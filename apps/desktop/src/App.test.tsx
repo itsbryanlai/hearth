@@ -59,6 +59,9 @@ function fakeIpc(snapshot: ThreadSnapshot = { thread: THREAD, turns: [], lastSeq
     worktreeInfo: vi.fn<Ipc["worktreeInfo"]>(async () => ({ isGit: false, base: null, reason: null })),
     createThread: vi.fn(),
     loadThread: vi.fn(async () => snapshot),
+    reviewTurns: vi.fn<Ipc["reviewTurns"]>(async () => []),
+    turnDiffFiles: vi.fn<Ipc["turnDiffFiles"]>(async () => null),
+    turnDiffFile: vi.fn<Ipc["turnDiffFile"]>(async () => null),
     listThreadModels: vi.fn(async (): Promise<ThreadModels> => ({ choices: [], selected: null, current: null })),
     setThreadModel: vi.fn<Ipc["setThreadModel"]>(async () => THREAD),
     sendMessage: vi.fn(async () => THREAD),
@@ -393,4 +396,53 @@ test("an unscoped approval only offers one-shot choices", async () => {
   expect(screen.getByRole("button", { name: "Allow once" })).toBeTruthy();
   expect(screen.getByRole("button", { name: "Deny" })).toBeTruthy();
   expect(screen.queryByRole("button", { name: "Allow for this thread" })).toBeNull();
+});
+
+// Fails if the latest turn or selected file cannot be reviewed and closing loses the composer.
+test("opens changes and selects a historical turn and file", async () => {
+  const { ipc } = fakeIpc();
+  ipc.reviewTurns.mockResolvedValue([{ turnId: "old", label: "Earlier", available: true }, { turnId: "new", label: "Latest", available: false }]);
+  ipc.turnDiffFiles.mockImplementation(async (_thread, turn) => [{ id: turn, path: `${turn}.txt`, oldPath: null, status: "modified" }]);
+  ipc.turnDiffFile.mockImplementation(async (_thread, _turn, file) => ({ binary: false, hunks: [{ header: "@@", rows: [{ kind: "add", text: `${file} content`, oldLine: null, newLine: 1 }], splitRows: [{ left: null, right: 0, notice: null }] }] }));
+  await openThread(ipc);
+  fireEvent.change(screen.getByLabelText("Message"), { target: { value: "draft" } });
+  fireEvent.click(screen.getByRole("button", { name: "Changes" }));
+  expect(await screen.findByText("old content", { exact: false })).toBeTruthy();
+  fireEvent.change(screen.getByLabelText("Turn"), { target: { value: "new" } });
+  expect(await screen.findByText("new content", { exact: false })).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Close changes" }));
+  expect((screen.getByLabelText("Message") as HTMLTextAreaElement).value).toBe("draft");
+});
+
+// Fails if changing the view hides line numbers or the changed text.
+test("switches between unified and side by side diffs", async () => {
+  const { ipc } = fakeIpc();
+  ipc.reviewTurns.mockResolvedValue([{ turnId: "t", label: "Turn", available: true }]);
+  ipc.turnDiffFiles.mockResolvedValue([{ id: "f", path: "file", oldPath: null, status: "modified" }]);
+  ipc.turnDiffFile.mockResolvedValue({ binary: false, hunks: [{ header: "@@", rows: [{ kind: "delete", text: "before", oldLine: 4, newLine: null }, { kind: "add", text: "after", oldLine: null, newLine: 5 }], splitRows: [{ left: 0, right: 1, notice: null }] }] });
+  await openThread(ipc);
+  fireEvent.click(screen.getByRole("button", { name: "Changes" }));
+  expect(await screen.findByText(/4.*before/)).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Side by side" }));
+  expect(screen.getByText(/4.*before/)).toBeTruthy();
+  expect(screen.getByText(/5.*after/)).toBeTruthy();
+  expect(screen.getByText(/4.*before/).parentElement).toBe(screen.getByText(/5.*after/).parentElement);
+});
+
+// Fails if a late response replaces the currently selected turn's empty result.
+test("keeps unavailable and empty turn results scoped to the selection", async () => {
+  const { ipc } = fakeIpc();
+  let resolveOld: (value: Awaited<ReturnType<Ipc["turnDiffFiles"]>>) => void = () => {};
+  ipc.reviewTurns.mockResolvedValue([{ turnId: "old", label: "Earlier", available: true }, { turnId: "new", label: "Latest", available: true }]);
+  ipc.turnDiffFiles.mockImplementation((_thread, turn) => turn === "old" ? new Promise((resolve) => { resolveOld = resolve; }) : Promise.resolve([]));
+  await openThread(ipc);
+  fireEvent.click(screen.getByRole("button", { name: "Changes" }));
+  expect(await screen.findByText("No files changed in this turn.")).toBeTruthy();
+  fireEvent.change(screen.getByLabelText("Turn"), { target: { value: "old" } });
+  fireEvent.change(screen.getByLabelText("Turn"), { target: { value: "new" } });
+  await act(async () => resolveOld(null));
+  expect(await screen.findByText("No files changed in this turn.")).toBeTruthy();
+  fireEvent.change(screen.getByLabelText("Turn"), { target: { value: "old" } });
+  await act(async () => resolveOld(null));
+  expect(await screen.findByText("Snapshot unavailable for this turn.")).toBeTruthy();
 });
