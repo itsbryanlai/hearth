@@ -70,6 +70,8 @@ function fakeIpc(snapshot: ThreadSnapshot = { thread: THREAD, turns: [], lastSeq
     restoreThread: vi.fn(async () => THREAD),
     listThreadModels: vi.fn(async (): Promise<ThreadModels> => ({ choices: [], selected: null, current: null })),
     setThreadModel: vi.fn<Ipc["setThreadModel"]>(async () => THREAD),
+    draftHandoff: vi.fn<Ipc["draftHandoff"]>(async (threadId, target) => ({ threadId, sourceAgent: "claude-code", targetAgent: target, text: `Draft for ${target}` })),
+    startHandoff: vi.fn<Ipc["startHandoff"]>(async () => ({ ...THREAD, agent: "qwen-code" })),
     sendMessage: vi.fn(async () => THREAD),
     answerApproval: vi.fn(async () => {}),
     cancelTurn: vi.fn(async () => {}),
@@ -536,4 +538,34 @@ test("pending archive blocks sending and survives a late thread load", async () 
   await act(async () => { finishLoad({ thread: THREAD, turns: [], lastSeq: 0 }); });
   expect(screen.getByRole("button", { name: "Restore" })).toBeTruthy();
   expect((screen.getByLabelText("Message") as HTMLTextAreaElement).disabled).toBe(true);
+});
+
+// Fails if Start does not send the edited draft to the chosen target.
+test("hand-off Start sends the edited draft to the chosen agent and the header follows", async () => {
+  const { ipc } = fakeIpc();
+  ipc.listAgents.mockResolvedValue([CLAUDE, QWEN]);
+  await openThread(ipc);
+  await vi.waitFor(() => expect(screen.getByRole("button", { name: "Hand off" }).hasAttribute("disabled")).toBe(false));
+  fireEvent.click(screen.getByRole("button", { name: "Hand off" }));
+  const box = (await screen.findByLabelText("Hand-off message")) as HTMLTextAreaElement;
+  await vi.waitFor(() => expect(box.value).toBe("Draft for qwen-code"));
+  fireEvent.change(box, { target: { value: "Edited preamble" } });
+  fireEvent.click(screen.getByRole("button", { name: "Start" }));
+  await vi.waitFor(() => expect(ipc.startHandoff).toHaveBeenCalledWith("th", "qwen-code", "Edited preamble"));
+  expect(await screen.findByText(/qwen-code ·/)).toBeDefined();
+  expect(screen.queryByLabelText("Hand-off message")).toBeNull();
+});
+
+// Fails if Cancel calls the backend to start the hand-off.
+test("hand-off Cancel closes the panel without starting anything", async () => {
+  const { ipc } = fakeIpc();
+  ipc.listAgents.mockResolvedValue([CLAUDE, QWEN]);
+  await openThread(ipc);
+  await vi.waitFor(() => expect(screen.getByRole("button", { name: "Hand off" }).hasAttribute("disabled")).toBe(false));
+  fireEvent.click(screen.getByRole("button", { name: "Hand off" }));
+  await screen.findByLabelText("Hand-off message");
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  expect(screen.queryByLabelText("Hand-off message")).toBeNull();
+  expect(ipc.startHandoff).not.toHaveBeenCalled();
+  expect(ipc.sendMessage).not.toHaveBeenCalled();
 });

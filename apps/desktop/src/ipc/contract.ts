@@ -21,6 +21,13 @@ export type InstalledAgent = {
   remembersApprovals: boolean;
 };
 
+export type HandoffDraft = {
+  threadId: ThreadId;
+  sourceAgent: AgentId;
+  targetAgent: AgentId;
+  text: string;
+};
+
 export type Project = { id: ProjectId; name: string; path: string };
 
 export type ThreadSummary = {
@@ -93,6 +100,10 @@ export interface Ipc {
   restoreThread(threadId: ThreadId): Promise<ThreadSummary>;
   listThreadModels(threadId: ThreadId): Promise<ThreadModels>;
   setThreadModel(threadId: ThreadId, modelId: string): Promise<ThreadSummary>;
+  /** Builds an editable preamble locally; starts nothing. */
+  draftHandoff(threadId: ThreadId, target: AgentId): Promise<HandoffDraft>;
+  /** Switches the thread to `target` and sends `text` as its first turn there. */
+  startHandoff(threadId: ThreadId, target: AgentId, text: string): Promise<ThreadSummary>;
   /** Resolves with the thread as it is once the turn started (title, model). */
   sendMessage(threadId: ThreadId, input: UserInput): Promise<ThreadSummary>;
   answerApproval(

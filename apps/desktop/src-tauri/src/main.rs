@@ -2,8 +2,8 @@ use hearth_engine::agents::Registration;
 use hearth_engine::agents::claude::ClaudeAdapter;
 use hearth_engine::agents::qwen::{QwenAdapter, QwenLauncher};
 use hearth_engine::{
-    DiffFile, Engine, EngineConfig, EventSink, FileDiff, InstalledAgent, Project, ReviewTurn,
-    ThreadEventPayload, ThreadModels, ThreadSnapshot, ThreadSummary, WorktreeReview,
+    DiffFile, Engine, EngineConfig, EventSink, FileDiff, HandoffDraft, InstalledAgent, Project,
+    ReviewTurn, ThreadEventPayload, ThreadModels, ThreadSnapshot, ThreadSummary, WorktreeReview,
 };
 use hearth_protocol::{
     AgentId, ApprovalDecision, ApprovalId, ProjectId, ThreadId, TurnId, UserInput,
@@ -185,6 +185,28 @@ async fn set_thread_model(
 }
 
 #[tauri::command]
+async fn draft_handoff(
+    engine: State<'_, Engine>,
+    thread_id: ThreadId,
+    target: AgentId,
+) -> Result<HandoffDraft, String> {
+    engine.draft_handoff(&thread_id, target).await.map_err(show)
+}
+
+#[tauri::command]
+async fn start_handoff(
+    engine: State<'_, Engine>,
+    thread_id: ThreadId,
+    target: AgentId,
+    text: String,
+) -> Result<ThreadSummary, String> {
+    engine
+        .start_handoff(&thread_id, target, text)
+        .await
+        .map_err(show)
+}
+
+#[tauri::command]
 async fn send_message(
     engine: State<'_, Engine>,
     thread_id: ThreadId,
@@ -309,6 +331,8 @@ fn main() {
             restore_thread,
             list_thread_models,
             set_thread_model,
+            draft_handoff,
+            start_handoff,
             send_message,
             answer_approval,
             cancel_turn

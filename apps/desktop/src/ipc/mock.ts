@@ -202,6 +202,24 @@ export function createMockIpc(options: Options = {}): Ipc {
       selections.set(threadId, modelId);
       return updated;
     },
+    async draftHandoff(threadId, target) {
+      const thread = threads.find((t) => t.id === threadId);
+      if (!thread) throw new Error(`unknown thread ${threadId}`);
+      if (thread.agent === target) throw new Error("This thread already uses that agent.");
+      return { threadId, sourceAgent: thread.agent, targetAgent: target, text: `Original goal:\n${thread.title}\n\nWorking tree:\nGit context is unavailable for this thread.\n` };
+    },
+    async startHandoff(threadId, target, text) {
+      const index = threads.findIndex((t) => t.id === threadId);
+      const thread = threads[index];
+      if (!thread) throw new Error(`unknown thread ${threadId}`);
+      if (running.has(threadId)) throw new Error("Wait for the current turn to finish.");
+      if (thread.agent === target) throw new Error("This thread already uses that agent.");
+      if (text.trim() === "") throw new Error("The hand-off message is empty.");
+      const updated = { ...thread, agent: target, model: "" };
+      threads[index] = updated;
+      selections.delete(threadId);
+      return this.sendMessage(threadId, { kind: "text", text }).then(() => updated);
+    },
     async sendMessage(threadId, input) {
       const thread = threads.find((t) => t.id === threadId);
       if (!thread) throw new Error(`unknown thread ${threadId}`);
