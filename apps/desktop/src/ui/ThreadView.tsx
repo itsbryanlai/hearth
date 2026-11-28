@@ -81,7 +81,7 @@ export function ThreadView() {
       ) : null}
       <div className="thread-content">
         {threadId ? <TranscriptView key={threadId} threadId={threadId} remembersApprovals={remembersApprovals} /> : <div className="transcript empty" />}
-        {threadId && changesOpen ? <Changes key={threadId} threadId={threadId} onClose={() => setChangesOpen(false)} /> : null}
+        {threadId && changesOpen ? <Changes key={threadId} threadId={threadId} worktree={thread?.branch != null} onClose={() => setChangesOpen(false)} /> : null}
       </div>
       <Composer />
     </main>

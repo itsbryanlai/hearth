@@ -12,6 +12,7 @@ struct PrivateGit {
     repo: PathBuf,
     objects: PathBuf,
     index: PathBuf,
+    alternate: Option<PathBuf>,
 }
 
 fn checked_dir(guard: &FsGuard, path: &Path) -> Result<PathBuf, String> {
@@ -68,6 +69,7 @@ impl PrivateGit {
             repo,
             objects,
             index,
+            alternate: None,
         })
     }
 
@@ -78,6 +80,7 @@ impl PrivateGit {
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_NO_LAZY_FETCH", "1")
             .env("GIT_OBJECT_DIRECTORY", &self.objects)
             .env("GIT_INDEX_FILE", &self.index)
             .arg("--git-dir")
@@ -86,6 +89,9 @@ impl PrivateGit {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if let Some(alternate) = &self.alternate {
+            cmd.env("GIT_ALTERNATE_OBJECT_DIRECTORIES", alternate);
+        }
         let mut child = cmd.spawn().map_err(|e| e.to_string())?;
         io::copy(input, &mut child.stdin.take().ok_or("missing Git stdin")?)
             .map_err(|e| e.to_string())?;
@@ -314,7 +320,11 @@ pub fn files(
     after: &str,
 ) -> Result<Vec<DiffFile>, String> {
     let git = PrivateGit::open(guard, data, false)?;
-    Ok(raw_files(&git, before, after)?
+    files_in(&git, before, after)
+}
+
+fn files_in(git: &PrivateGit, before: &str, after: &str) -> Result<Vec<DiffFile>, String> {
+    Ok(raw_files(git, before, after)?
         .into_iter()
         .map(|file| DiffFile {
             id: path_id(&file.path),
@@ -327,6 +337,185 @@ pub fn files(
         .collect())
 }
 
+#[cfg(unix)]
+const REVIEW_MARKER: &str = ".hearth-live-review";
+#[cfg(unix)]
+const REVIEW_MARKER_CONTENT: &[u8] = b"hearth live review v1\n";
+
+#[cfg(unix)]
+fn write_review_marker(lease: &std::fs::File) -> Result<(), String> {
+    use rustix::fs::{Mode, OFlags, openat};
+    use std::io::Write;
+    let fd = openat(
+        lease,
+        REVIEW_MARKER,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .map_err(|e| e.to_string())?;
+    std::fs::File::from(fd)
+        .write_all(REVIEW_MARKER_CONTENT)
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(unix)]
+fn has_review_marker(lease: &std::fs::File) -> bool {
+    use rustix::fs::{Mode, OFlags, openat};
+    let Ok(fd) = openat(
+        lease,
+        REVIEW_MARKER,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) else {
+        return false;
+    };
+    let file = std::fs::File::from(fd);
+    if !file
+        .metadata()
+        .is_ok_and(|m| m.is_file() && m.len() == REVIEW_MARKER_CONTENT.len() as u64)
+    {
+        return false;
+    }
+    let mut contents = Vec::new();
+    file.take(REVIEW_MARKER_CONTENT.len() as u64 + 1)
+        .read_to_end(&mut contents)
+        .is_ok()
+        && contents == REVIEW_MARKER_CONTENT
+}
+
+#[cfg(unix)]
+struct ReviewDirectory {
+    temp: tempfile::TempDir,
+    _lease: std::fs::File,
+}
+
+#[cfg(unix)]
+fn lease_review(path: &Path) -> Result<std::fs::File, String> {
+    use rustix::fs::{FlockOperation, Mode, OFlags, flock, open};
+    use std::os::unix::fs::MetadataExt;
+    let fd = open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| e.to_string())?;
+    let file = std::fs::File::from(fd);
+    flock(&file, FlockOperation::NonBlockingLockExclusive).map_err(|e| e.to_string())?;
+    let opened = file.metadata().map_err(|e| e.to_string())?;
+    let named = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if !named.is_dir()
+        || opened.dev() != named.dev()
+        || opened.ino() != named.ino()
+        || opened.nlink() == 0
+    {
+        return Err("review directory changed while acquiring lease".into());
+    }
+    Ok(file)
+}
+
+/// Remove abandoned live reviews without disturbing active reviews or snapshots.
+#[cfg(unix)]
+pub fn recover_live_reviews(guard: &FsGuard, parent: &Path) -> Result<(), String> {
+    let parent = checked_dir(guard, parent)?;
+    for entry in std::fs::read_dir(&parent).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(suffix) = name.strip_prefix("live-review-") else {
+            continue;
+        };
+        if suffix.len() != 6 || !suffix.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            continue;
+        }
+        let path = entry.path();
+        if guard.try_check(&path).ok().as_ref().map(|p| p.as_path()) != Some(path.as_path()) {
+            continue;
+        }
+        if let Ok(lease) = lease_review(&path)
+            && has_review_marker(&lease)
+        {
+            std::fs::remove_dir_all(path).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// A captured working tree and a private, guarded copy of its base objects.
+#[cfg(unix)]
+pub struct LiveReview {
+    git: PrivateGit,
+    before: String,
+    after: String,
+    _directory: ReviewDirectory,
+}
+
+#[cfg(unix)]
+impl LiveReview {
+    pub fn open(
+        guard: &FsGuard,
+        parent: &Path,
+        root: &Path,
+        gitdir: &Path,
+        common: &Path,
+        base: &str,
+    ) -> Result<Self, String> {
+        let parent = checked_dir(guard, parent)?;
+        let temp = tempfile::Builder::new()
+            .prefix("live-review-")
+            .tempdir_in(parent)
+            .map_err(|e| e.to_string())?;
+        let lease = lease_review(temp.path())?;
+        let directory = ReviewDirectory {
+            temp,
+            _lease: lease,
+        };
+        write_review_marker(&directory._lease)?;
+        let data = directory.temp.path();
+        let paths = select(guard, data, root, gitdir, common)?;
+        let after = capture(guard, data, root, &paths)?;
+        valid_trees(base, &after)?;
+        let mut git = PrivateGit::open(guard, data, false)?;
+        let alternate = git._temp.path().join("source-objects");
+        // Git parses this environment variable as a path list.
+        let path = alternate
+            .to_str()
+            .ok_or("unsupported object path encoding")?;
+        if path.contains([':', '"', '\\', '\n', '\r']) {
+            return Err("unsupported object path encoding".into());
+        }
+        std::fs::create_dir(&alternate).map_err(|e| e.to_string())?;
+        guard.copy_git_objects(&common.join("objects"), &alternate)?;
+        git.alternate = Some(alternate);
+        let tree = git.git(
+            &[
+                "rev-parse".into(),
+                "--verify".into(),
+                format!("{base}^{{tree}}").into(),
+            ],
+            &mut &[][..],
+        )?;
+        let before = String::from_utf8(tree)
+            .map_err(|e| e.to_string())?
+            .trim()
+            .to_owned();
+        valid_trees(&before, &after)?;
+        Ok(Self {
+            git,
+            before,
+            after,
+            _directory: directory,
+        })
+    }
+
+    pub fn files(&self) -> Result<Vec<DiffFile>, String> {
+        files_in(&self.git, &self.before, &self.after)
+    }
+
+    pub fn file_diff(&self, id: &str) -> Result<FileDiff, String> {
+        file_diff_in(&self.git, &self.before, &self.after, id)
+    }
+}
+
 /// Reads one previously listed path and parses its unified hunks.
 #[cfg(unix)]
 pub fn file_diff(
@@ -337,7 +526,12 @@ pub fn file_diff(
     id: &str,
 ) -> Result<FileDiff, String> {
     let git = PrivateGit::open(guard, data, false)?;
-    let file = raw_files(&git, before, after)?
+    file_diff_in(&git, before, after, id)
+}
+
+#[cfg(unix)]
+fn file_diff_in(git: &PrivateGit, before: &str, after: &str, id: &str) -> Result<FileDiff, String> {
+    let file = raw_files(git, before, after)?
         .into_iter()
         .find(|file| path_id(&file.path) == id)
         .ok_or("unknown diff file")?;
@@ -348,8 +542,9 @@ pub fn file_diff(
             git.git(&["cat-file".into(), "blob".into(), id.into()], &mut &[][..])
         }
     };
-    let old_path = git._temp.path().join("old");
-    let new_path = git._temp.path().join("new");
+    let temporary = tempfile::tempdir_in(git._temp.path()).map_err(|e| e.to_string())?;
+    let old_path = temporary.path().join("old");
+    let new_path = temporary.path().join("new");
     std::fs::write(&old_path, blob(&file.old_blob)?).map_err(|e| e.to_string())?;
     std::fs::write(&new_path, blob(&file.new_blob)?).map_err(|e| e.to_string())?;
     let patch = git.git(

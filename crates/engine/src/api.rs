@@ -73,6 +73,14 @@ pub struct ReviewTurn {
     pub available: bool,
 }
 
+/// A captured review of a thread's current working copy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeReview {
+    pub id: String,
+    pub files: Vec<hearth_core::snapshot::DiffFile>,
+}
+
 /// One user message and the agent events it produced, in order.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]

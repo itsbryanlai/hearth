@@ -881,6 +881,213 @@ fn init_git(w: &World) {
     );
 }
 
+// Fails if the whole-worktree review misses untracked files, changes Git metadata,
+// or reads later checkout contents instead of the captured tree.
+#[tokio::test]
+async fn worktree_review_captures_and_reads_the_original_view() {
+    let w = world();
+    init_git(&w);
+    git_in(&w.project, &["repack", "-ad"]);
+    let (app, _) = engine(&w, fixture("acp-cancel.jsonl"));
+    let project = app.add_project(w.project.to_str().unwrap()).unwrap();
+    let thread = app
+        .create_thread_in(&project.id, AgentId::QwenCode, Some("HEAD".into()))
+        .await
+        .unwrap();
+    let direct = app
+        .create_thread(&project.id, AgentId::QwenCode)
+        .await
+        .unwrap();
+    assert!(
+        app.worktree_diff_files(&direct.id, &app.start_worktree_review(&direct.id))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let saved = hearth_core::store::Store::open(&w.db)
+        .unwrap()
+        .get_thread(&thread.id)
+        .unwrap();
+    let checkout = Path::new(&saved.cwd);
+    std::fs::write(checkout.join("tracked"), "first\n").unwrap();
+    std::fs::write(checkout.join("new"), "new file\n").unwrap();
+    let other = app
+        .create_thread_in(&project.id, AgentId::QwenCode, Some("HEAD".into()))
+        .await
+        .unwrap();
+    let other_saved = hearth_core::store::Store::open(&w.db)
+        .unwrap()
+        .get_thread(&other.id)
+        .unwrap();
+    let index_before = std::fs::read(w.project.join(".git/index")).unwrap();
+    let refs_before = git_in(&w.project, &["show-ref"]);
+    let objects_before = git_in(&w.project, &["count-objects", "-v"]);
+    let durable = w.db.parent().unwrap().join("snapshots");
+    std::fs::create_dir(&durable).unwrap();
+    std::fs::write(durable.join("retained"), b"existing snapshot").unwrap();
+    let view = app
+        .worktree_diff_files(&thread.id, &app.start_worktree_review(&thread.id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(std::fs::read_dir(&durable).unwrap().count(), 1);
+    assert_eq!(
+        std::fs::read(durable.join("retained")).unwrap(),
+        b"existing snapshot"
+    );
+    assert_eq!(
+        view.files
+            .iter()
+            .map(|f| (f.path.as_str(), f.status.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("new", "A"), ("tracked", "M")]
+    );
+    let file = view.files.iter().find(|f| f.path == "tracked").unwrap();
+    std::fs::write(checkout.join("tracked"), "later\n").unwrap();
+    let diff = app
+        .worktree_diff_file(&thread.id, &view.id, &file.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        diff.hunks
+            .iter()
+            .flat_map(|h| &h.rows)
+            .any(|r| r.text == "first")
+    );
+    assert!(
+        !diff
+            .hunks
+            .iter()
+            .flat_map(|h| &h.rows)
+            .any(|r| r.text == "later")
+    );
+    assert!(
+        app.worktree_diff_file(&direct.id, &view.id, &file.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let dotgit = checkout.join(".git");
+    let original = std::fs::read(&dotgit).unwrap();
+    std::fs::write(
+        &dotgit,
+        std::fs::read(Path::new(&other_saved.cwd).join(".git")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        app.worktree_diff_file(&thread.id, &view.id, &file.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    std::fs::write(&dotgit, original).unwrap();
+
+    let next = app
+        .worktree_diff_files(&thread.id, &app.start_worktree_review(&thread.id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(view.id, next.id);
+    assert!(
+        app.worktree_diff_file(&thread.id, &view.id, &file.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    app.release_worktree_review(&thread.id, &next.id).await;
+    assert_eq!(std::fs::read_dir(&durable).unwrap().count(), 1);
+    assert!(
+        !std::fs::read_dir(w.db.parent().unwrap())
+            .unwrap()
+            .any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("live-review-")
+            })
+    );
+    assert!(
+        app.worktree_diff_file(&thread.id, &next.id, &file.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        std::fs::read(w.project.join(".git/index")).unwrap(),
+        index_before
+    );
+    assert_eq!(git_in(&w.project, &["show-ref"]), refs_before);
+    assert_eq!(git_in(&w.project, &["count-objects", "-v"]), objects_before);
+}
+
+// Fails if releasing a pending review allows it to replace a newer request.
+#[tokio::test]
+async fn released_pending_worktree_review_cannot_replace_a_new_request() {
+    let w = world();
+    init_git(&w);
+    let (app, _) = engine(&w, fixture("acp-cancel.jsonl"));
+    let project = app.add_project(w.project.to_str().unwrap()).unwrap();
+    let thread = app
+        .create_thread_in(&project.id, AgentId::QwenCode, Some("HEAD".into()))
+        .await
+        .unwrap();
+    let cancelled = app.start_worktree_review(&thread.id);
+    app.release_worktree_review(&thread.id, &cancelled).await;
+    let current = app.start_worktree_review(&thread.id);
+    assert!(
+        app.worktree_diff_files(&thread.id, &cancelled)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    app.release_worktree_review(&thread.id, &cancelled).await;
+    assert!(
+        app.worktree_diff_files(&thread.id, &current)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    app.release_worktree_review(&thread.id, &current).await;
+}
+
+// Fails if a source alternate is followed to read an unguarded object store.
+#[tokio::test]
+async fn worktree_review_rejects_source_object_alternates() {
+    let w = world();
+    init_git(&w);
+    let (app, _) = engine(&w, fixture("acp-cancel.jsonl"));
+    let project = app.add_project(w.project.to_str().unwrap()).unwrap();
+    let thread = app
+        .create_thread_in(&project.id, AgentId::QwenCode, Some("HEAD".into()))
+        .await
+        .unwrap();
+    std::fs::write(
+        w.project.join(".git/objects/info/alternates"),
+        "../elsewhere\n",
+    )
+    .unwrap();
+    assert!(
+        app.worktree_diff_files(&thread.id, &app.start_worktree_review(&thread.id))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !std::fs::read_dir(w.db.parent().unwrap())
+            .unwrap()
+            .any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("live-review-")
+            })
+    );
+    assert!(!w.db.parent().unwrap().join("snapshots").exists());
+}
+
 // Fails if creation skips home-configured hooks, changes the source, loses its base, or reopens external metadata.
 #[tokio::test]
 async fn worktree_persists_and_reopens_with_the_source_untouched() {

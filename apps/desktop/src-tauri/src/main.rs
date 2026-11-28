@@ -3,7 +3,7 @@ use hearth_engine::agents::claude::ClaudeAdapter;
 use hearth_engine::agents::qwen::{QwenAdapter, QwenLauncher};
 use hearth_engine::{
     DiffFile, Engine, EngineConfig, EventSink, FileDiff, InstalledAgent, Project, ReviewTurn,
-    ThreadEventPayload, ThreadModels, ThreadSnapshot, ThreadSummary,
+    ThreadEventPayload, ThreadModels, ThreadSnapshot, ThreadSummary, WorktreeReview,
 };
 use hearth_protocol::{
     AgentId, ApprovalDecision, ApprovalId, ProjectId, ThreadId, TurnId, UserInput,
@@ -109,6 +109,46 @@ async fn turn_diff_file(
         .turn_diff_file(&thread_id, &turn_id, &file_id)
         .await
         .map_err(show)
+}
+
+#[tauri::command]
+fn start_worktree_review(engine: State<'_, Engine>, thread_id: ThreadId) -> String {
+    engine.start_worktree_review(&thread_id)
+}
+
+#[tauri::command]
+async fn worktree_diff_files(
+    engine: State<'_, Engine>,
+    thread_id: ThreadId,
+    review_id: String,
+) -> Result<Option<WorktreeReview>, String> {
+    engine
+        .worktree_diff_files(&thread_id, &review_id)
+        .await
+        .map_err(show)
+}
+
+#[tauri::command]
+async fn worktree_diff_file(
+    engine: State<'_, Engine>,
+    thread_id: ThreadId,
+    review_id: String,
+    file_id: String,
+) -> Result<Option<FileDiff>, String> {
+    engine
+        .worktree_diff_file(&thread_id, &review_id, &file_id)
+        .await
+        .map_err(show)
+}
+
+#[tauri::command]
+async fn release_worktree_review(
+    engine: State<'_, Engine>,
+    thread_id: ThreadId,
+    review_id: String,
+) -> Result<(), String> {
+    engine.release_worktree_review(&thread_id, &review_id).await;
+    Ok(())
 }
 
 #[tauri::command]
@@ -246,6 +286,10 @@ fn main() {
             create_thread,
             load_thread,
             review_turns,
+            start_worktree_review,
+            worktree_diff_files,
+            worktree_diff_file,
+            release_worktree_review,
             turn_diff_files,
             turn_diff_file,
             list_thread_models,

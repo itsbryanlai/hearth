@@ -1,11 +1,13 @@
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { DiffFile, DiffRow, FileDiff, ReviewTurn } from "../ipc/contract";
+import type { DiffFile, DiffRow, FileDiff, ReviewTurn, WorktreeReview } from "../ipc/contract";
 import { useApp } from "../state/context";
 
 type Load<T> = { kind: "loading" } | { kind: "error" } | { kind: "ready"; value: T };
 
-export function Changes({ threadId, onClose }: { threadId: string; onClose: () => void }) {
+export function Changes({ threadId, worktree, onClose }: { threadId: string; worktree: boolean; onClose: () => void }) {
+  const [scope, setScope] = useState<"turn" | "worktree">("turn");
+  const [refresh, setRefresh] = useState(0);
   const reviewTurns = useApp((s) => s.reviewTurns);
   const [turns, setTurns] = useState<Load<ReviewTurn[]>>({ kind: "loading" });
   const [turnId, setTurnId] = useState("");
@@ -41,15 +43,87 @@ export function Changes({ threadId, onClose }: { threadId: string; onClose: () =
         <strong>Changes</strong>
         <button onClick={onClose}>Close changes</button>
       </header>
-      {content}
+      {worktree ? (
+        <label>
+          Scope
+          <select
+            aria-label="Scope"
+            value={scope}
+            onChange={(e) => setScope(e.target.value === "worktree" ? "worktree" : "turn")}
+          >
+            <option value="turn">Turn</option>
+            <option value="worktree">Worktree</option>
+          </select>
+        </label>
+      ) : null}
+      {scope === "worktree" && worktree ? (
+        <>
+          <button onClick={() => setRefresh((n) => n + 1)}>Refresh</button>
+          <WorktreeChanges key={refresh} threadId={threadId} />
+        </>
+      ) : content}
     </section>
   );
 }
 
+type Scope = { kind: "turn"; id: string } | { kind: "worktree"; id: string };
+
 function TurnChanges({ threadId, turnId }: { threadId: string; turnId: string }) {
   const load = useApp((s) => s.turnDiffFiles);
   const [files, setFiles] = useState<Load<DiffFile[] | null>>({ kind: "loading" });
-  const [fileId, setFileId] = useState("");
+  useEffect(() => {
+    let live = true;
+    void load(threadId, turnId).then(
+      (value) => { if (live) setFiles({ kind: "ready", value }); },
+      () => { if (live) setFiles({ kind: "error" }); },
+    );
+    return () => { live = false; };
+  }, [threadId, turnId, load]);
+  return <ChangesFiles threadId={threadId} scope={{ kind: "turn", id: turnId }} files={files} />;
+}
+
+function WorktreeChanges({ threadId }: { threadId: string }) {
+  const start = useApp((s) => s.startWorktreeReview);
+  const capture = useApp((s) => s.worktreeDiffFiles);
+  const release = useApp((s) => s.releaseWorktreeReview);
+  const [review, setReview] = useState<Load<WorktreeReview | null>>({ kind: "loading" });
+  useEffect(() => {
+    let live = true;
+    let id: string | undefined;
+    void (async () => {
+      try {
+        const reserved = await start(threadId);
+        if (!live) {
+          await release(threadId, reserved).catch(() => {});
+          return;
+        }
+        id = reserved;
+        const value = await capture(threadId, reserved);
+        if (live) {
+          setReview({ kind: "ready", value });
+        }
+      } catch {
+        if (live) {
+          setReview({ kind: "error" });
+        }
+      }
+    })();
+    return () => {
+      live = false;
+      if (id !== undefined) {
+        void release(threadId, id).catch(() => {});
+      }
+    };
+  }, [threadId, start, capture, release]);
+  if (review.kind === "loading") return <p>Loading files…</p>;
+  if (review.kind === "error") return <p role="alert">Could not load changes.</p>;
+  if (review.value === null) return <p>Worktree changes unavailable.</p>;
+  return <ChangesFiles threadId={threadId} scope={{ kind: "worktree", id: review.value.id }} files={{ kind: "ready", value: review.value.files }} />;
+}
+
+function ChangesFiles({ threadId, scope, files }: { threadId: string; scope: Scope; files: Load<DiffFile[] | null> }) {
+  const [selected, setSelected] = useState("");
+  const fileId = selected || (files.kind === "ready" ? files.value?.[0]?.id ?? "" : "");
   const scrollRef = useRef<HTMLDivElement>(null);
   const list = files.kind === "ready" ? files.value ?? [] : [];
   // eslint-disable-next-line react-hooks/incompatible-library
@@ -59,20 +133,10 @@ function TurnChanges({ threadId, turnId }: { threadId: string; turnId: string })
     estimateSize: () => 34,
     overscan: 6,
   });
-  useEffect(() => {
-    let live = true;
-    void load(threadId, turnId).then((value) => {
-      if (live) {
-        setFiles({ kind: "ready", value });
-        setFileId(value?.[0]?.id ?? "");
-      }
-    }, () => { if (live) setFiles({ kind: "error" }); });
-    return () => { live = false; };
-  }, [threadId, turnId, load]);
   if (files.kind === "loading") return <p>Loading files…</p>;
   if (files.kind === "error") return <p role="alert">Could not load changes.</p>;
-  if (files.value === null) return <p>Snapshot unavailable for this turn.</p>;
-  if (files.value.length === 0) return <p>No files changed in this turn.</p>;
+  if (files.value === null) return <p>{scope.kind === "turn" ? "Snapshot unavailable for this turn." : "Worktree changes unavailable."}</p>;
+  if (files.value.length === 0) return <p>{scope.kind === "turn" ? "No files changed in this turn." : "No files changed in this worktree."}</p>;
   return (
     <div className="changes-body">
       <nav className="changes-files" aria-label="Changed files" ref={scrollRef}>
@@ -86,7 +150,7 @@ function TurnChanges({ threadId, turnId }: { threadId: string; turnId: string })
                 className="changes-file"
                 aria-current={file.id === fileId ? "true" : undefined}
                 style={{ transform: `translateY(${row.start}px)` }}
-                onClick={() => setFileId(file.id)}
+                onClick={() => setSelected(file.id)}
               >
                 {file.status} {file.oldPath ? `${file.oldPath} → ` : ""}{file.path}
               </button>
@@ -94,7 +158,7 @@ function TurnChanges({ threadId, turnId }: { threadId: string; turnId: string })
           })}
         </div>
       </nav>
-      {fileId ? <FileChanges key={fileId} threadId={threadId} turnId={turnId} fileId={fileId} /> : null}
+      {fileId ? <FileChanges key={fileId} threadId={threadId} scope={scope} fileId={fileId} /> : null}
     </div>
   );
 }
@@ -125,8 +189,9 @@ function RowContent({ row }: { row: DisplayRow }) {
   return <span>{row.row.oldLine ?? ""} {row.row.newLine ?? ""} {marker} {row.row.text}</span>;
 }
 
-function FileChanges({ threadId, turnId, fileId }: { threadId: string; turnId: string; fileId: string }) {
-  const load = useApp((s) => s.turnDiffFile);
+function FileChanges({ threadId, scope, fileId }: { threadId: string; scope: Scope; fileId: string }) {
+  const loadTurn = useApp((s) => s.turnDiffFile);
+  const loadWorktree = useApp((s) => s.worktreeDiffFile);
   const [diff, setDiff] = useState<Load<FileDiff | null>>({ kind: "loading" });
   const [split, setSplit] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -152,17 +217,18 @@ function FileChanges({ threadId, turnId, fileId }: { threadId: string; turnId: s
   });
   useEffect(() => {
     let live = true;
-    void load(threadId, turnId, fileId).then(
+    const request = scope.kind === "turn" ? loadTurn(threadId, scope.id, fileId) : loadWorktree(threadId, scope.id, fileId);
+    void request.then(
       (value) => { if (live) setDiff({ kind: "ready", value }); },
       () => { if (live) setDiff({ kind: "error" }); },
     );
     return () => { live = false; };
-  }, [threadId, turnId, fileId, load]);
+  }, [threadId, scope.kind, scope.id, fileId, loadTurn, loadWorktree]);
 
   let content;
   if (diff.kind === "loading") content = <p>Loading diff…</p>;
   else if (diff.kind === "error") content = <p role="alert">Could not load diff.</p>;
-  else if (diff.value === null) content = <p>Snapshot unavailable for this turn.</p>;
+  else if (diff.value === null) content = <p>{scope.kind === "turn" ? "Snapshot unavailable for this turn." : "Worktree changes unavailable."}</p>;
   else if (diff.value.binary) content = <p>Binary file; diff unavailable.</p>;
   else if (rows.length === 0) content = <p>No textual changes.</p>;
   else content = (

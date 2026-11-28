@@ -64,6 +64,7 @@ export type ThreadEventPayload = {
 export const THREAD_EVENT_CHANNEL = "thread-event";
 
 export type ReviewTurn = { turnId: TurnId; label: string; available: boolean };
+export type WorktreeReview = { id: string; files: DiffFile[] };
 export type DiffFile = { id: string; path: string; oldPath: string | null; status: string };
 export type DiffRow = { kind: "context" | "delete" | "add" | "notice"; text: string; oldLine: number | null; newLine: number | null };
 export type FileDiff = { binary: boolean; hunks: { header: string; rows: DiffRow[]; splitRows: { left: number | null; right: number | null; notice: number | null }[] }[] };
@@ -81,6 +82,10 @@ export interface Ipc {
   createThread(projectId: ProjectId, agent: AgentId, base: string | null, parent?: string | null): Promise<ThreadSummary>;
   loadThread(threadId: ThreadId): Promise<ThreadSnapshot>;
   reviewTurns(threadId: ThreadId): Promise<ReviewTurn[]>;
+  startWorktreeReview(threadId: ThreadId): Promise<string>;
+  worktreeDiffFiles(threadId: ThreadId, reviewId: string): Promise<WorktreeReview | null>;
+  worktreeDiffFile(threadId: ThreadId, reviewId: string, fileId: string): Promise<FileDiff | null>;
+  releaseWorktreeReview(threadId: ThreadId, reviewId: string): Promise<void>;
   turnDiffFiles(threadId: ThreadId, turnId: TurnId): Promise<DiffFile[] | null>;
   turnDiffFile(threadId: ThreadId, turnId: TurnId, fileId: string): Promise<FileDiff | null>;
   listThreadModels(threadId: ThreadId): Promise<ThreadModels>;

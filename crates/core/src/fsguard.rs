@@ -324,6 +324,124 @@ impl FsGuard {
         ))
     }
 
+    /// Copy a Git object directory without following any source symlinks.
+    #[cfg(unix)]
+    pub fn copy_git_objects(&self, source: &Path, destination: &Path) -> Result<(), String> {
+        use rustix::fs::{Dir, Mode, OFlags, open, openat};
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
+        let checked = self.try_check(source).map_err(|e| e.to_string())?;
+        if checked.as_path() != source || !self.allows_snapshot_traversal(source) {
+            return Err("redirected object directory".into());
+        }
+        let mut fd = open(
+            "/",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|e| e.to_string())?;
+        for part in source.components() {
+            if let std::path::Component::Normal(name) = part {
+                fd = openat(
+                    &fd,
+                    name,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+        #[derive(Clone, Copy)]
+        enum Part {
+            Root,
+            Info,
+            Pack,
+            Loose,
+        }
+        fn hex(bytes: &[u8]) -> bool {
+            bytes
+                .iter()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+        }
+        fn copy(fd: rustix::fd::OwnedFd, target: &Path, part: Part) -> Result<(), String> {
+            let mut dir = Dir::new(fd).map_err(|e| e.to_string())?;
+            while let Some(entry) = dir.next() {
+                let entry = entry.map_err(|e| e.to_string())?;
+                let bytes = entry.file_name().to_bytes();
+                let subdir = match part {
+                    Part::Root if bytes == b"info" => Some(Part::Info),
+                    Part::Root if bytes == b"pack" => Some(Part::Pack),
+                    Part::Root if bytes.len() == 2 && hex(bytes) => Some(Part::Loose),
+                    Part::Info if bytes == b"alternates" || bytes == b"http-alternates" => {
+                        return Err("source object alternates are unsupported".into());
+                    }
+                    Part::Pack if bytes.ends_with(b".promisor") => {
+                        return Err("promisor object stores are unsupported".into());
+                    }
+                    _ => None,
+                };
+                let object_file = match part {
+                    Part::Loose => bytes.len() == 38 && hex(bytes),
+                    Part::Pack => {
+                        (bytes.len() == 50 && bytes.ends_with(b".pack")
+                            || bytes.len() == 49 && bytes.ends_with(b".idx"))
+                            && bytes.starts_with(b"pack-")
+                            && hex(&bytes[5..45])
+                    }
+                    _ => false,
+                };
+                if subdir.is_none() && !object_file {
+                    continue;
+                }
+                let name = std::ffi::OsStr::from_bytes(bytes);
+                let parent = dir.fd().map_err(|e| e.to_string())?;
+                let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
+                let child =
+                    openat(parent, name, flags, Mode::empty()).map_err(|e| e.to_string())?;
+                let mut file = std::fs::File::from(child);
+                let metadata = file.metadata().map_err(|e| e.to_string())?;
+                let dest = target.join(name);
+                if let Some(part) = subdir {
+                    if !metadata.is_dir() {
+                        return Err("invalid object directory".into());
+                    }
+                    if !matches!(part, Part::Info) {
+                        std::fs::create_dir(&dest).map_err(|e| e.to_string())?;
+                    }
+                    copy(file.into(), &dest, part)?;
+                } else if metadata.is_file() {
+                    let space = rustix::fs::statvfs(target).map_err(|e| e.to_string())?;
+                    let available = space.f_bavail.saturating_mul(space.f_frsize);
+                    // Leave space for unrelated operations while copying the private object store.
+                    const HEADROOM: u64 = 128 * 1024 * 1024;
+                    if metadata.len() > available.saturating_sub(HEADROOM) {
+                        return Err("insufficient space for source objects".into());
+                    }
+                    let mut out = std::fs::File::create(dest).map_err(|e| e.to_string())?;
+                    let copied = io::copy(
+                        &mut std::io::Read::take(&mut file, metadata.len()),
+                        &mut out,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    let after = file.metadata().map_err(|e| e.to_string())?;
+                    if copied != metadata.len()
+                        || after.len() != metadata.len()
+                        || after.mtime() != metadata.mtime()
+                        || after.mtime_nsec() != metadata.mtime_nsec()
+                        || after.ctime() != metadata.ctime()
+                        || after.ctime_nsec() != metadata.ctime_nsec()
+                    {
+                        return Err("source object changed during copy".into());
+                    }
+                } else {
+                    return Err("unsupported object entry".into());
+                }
+            }
+            Ok(())
+        }
+        copy(fd, destination, Part::Root)
+    }
+
     pub fn read_to_string(&self, path: &Path) -> Result<String, FsError> {
         let p = self.check(path)?;
         Ok(std::fs::read_to_string(p.as_path())?)

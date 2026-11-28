@@ -165,3 +165,143 @@ fn concurrent_captures_preserve_both_trees() {
         assert!(diff.contains("-first contents") && diff.contains("+second contents"));
     });
 }
+
+// Fails if an object larger than available space is copied or leaves a partial review.
+#[test]
+fn live_review_refuses_an_object_without_space_and_cleans_up() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let project = base.join("project");
+    let data = base.join("data");
+    fs::create_dir(&project).unwrap();
+    fs::create_dir(&data).unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec![
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "base",
+        ],
+    ] {
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&project)
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&project)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let commit = String::from_utf8(output.stdout).unwrap();
+    let guard = FsGuard::new([project.clone(), data.clone()], base);
+    let gitdir = project.join(".git");
+    drop(
+        snapshot::LiveReview::open(&guard, &data, &project, &gitdir, &gitdir, commit.trim())
+            .unwrap(),
+    );
+    let objects = project.join(".git/objects");
+    fs::create_dir_all(objects.join("aa")).unwrap();
+    let space = rustix::fs::statvfs(&data).unwrap();
+    let size = space
+        .f_bavail
+        .saturating_mul(space.f_frsize)
+        .saturating_add(1);
+    fs::File::create(objects.join("aa").join("a".repeat(38)))
+        .unwrap()
+        .set_len(size)
+        .unwrap();
+    let error =
+        snapshot::LiveReview::open(&guard, &data, &project, &gitdir, &gitdir, commit.trim())
+            .err()
+            .unwrap();
+    assert!(error.contains("insufficient space"));
+    assert_eq!(fs::read_dir(&data).unwrap().count(), 0);
+}
+
+// Fails if recovery removes a live review, follows a symlink, or retains an abandoned review.
+#[test]
+fn recovery_preserves_leased_reviews_and_durable_snapshots() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let project = base.join("project");
+    let data = base.join("data");
+    fs::create_dir(&project).unwrap();
+    fs::create_dir(&data).unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec![
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "base",
+        ],
+    ] {
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&project)
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&project)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let commit = String::from_utf8(output.stdout).unwrap();
+    let guard = FsGuard::new([project.clone(), data.clone()], base.clone());
+    let gitdir = project.join(".git");
+    let review =
+        snapshot::LiveReview::open(&guard, &data, &project, &gitdir, &gitdir, commit.trim())
+            .unwrap();
+    let live = fs::read_dir(&data).unwrap().next().unwrap().unwrap().path();
+    let abandoned = data.join("live-review-ABC123");
+    fs::create_dir(&abandoned).unwrap();
+    fs::copy(
+        live.join(".hearth-live-review"),
+        abandoned.join(".hearth-live-review"),
+    )
+    .unwrap();
+    fs::write(abandoned.join("private"), b"abandoned").unwrap();
+    let lookalike = data.join("live-review-GHI789");
+    fs::create_dir(&lookalike).unwrap();
+    fs::write(lookalike.join("retained"), b"unmarked").unwrap();
+    let durable = data.join("snapshots");
+    fs::create_dir(&durable).unwrap();
+    fs::write(durable.join("retained"), b"durable").unwrap();
+    symlink(&durable, data.join("live-review-DEF456")).unwrap();
+    snapshot::recover_live_reviews(&guard, &data).unwrap();
+    assert!(!abandoned.exists());
+    assert_eq!(fs::read(lookalike.join("retained")).unwrap(), b"unmarked");
+    assert_eq!(fs::read(durable.join("retained")).unwrap(), b"durable");
+    assert!(review.files().is_ok());
+    assert!(
+        fs::symlink_metadata(data.join("live-review-DEF456"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(fs::read_dir(&data).unwrap().count(), 4);
+}
